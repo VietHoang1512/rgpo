@@ -18,8 +18,6 @@ nvidia-smi
 # unset PYTHONPATH
 
 cd /scratch/hvp2011/implement/self_play
-export HF_TOKEN=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
-export WANDB_API_KEY="8e206762de4253cfbf4fd8db344147e420be8b78"
 export HYDRA_FULL_ERROR=1 
 # pip install torch transformers datasets 
 # pip install wandb --force-reinstall
