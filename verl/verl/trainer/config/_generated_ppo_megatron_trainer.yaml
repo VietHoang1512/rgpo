@@ -292,6 +292,7 @@ data:
   truncation: error
   image_key: images
   video_key: videos
+  response_key: answer
   system_prompt: You are a helpful assistant
   trust_remote_code: false
   custom_cls:

@@ -69,6 +69,9 @@ truncation: error
 # The field in the multi-modal dataset where the image is located. Default is 'images'.
 image_key: images
 
+response_key: answer
+
+
 # The field in the multi-modal dataset where the video is located.
 video_key: videos
 
