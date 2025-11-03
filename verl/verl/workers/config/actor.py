@@ -122,6 +122,14 @@ class ActorConfig(BaseConfig):
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
 
+    # DPO
+    use_dpo_loss: bool = True
+    dpo_coef: float = 0.5
+    dpo_beta: float = 0.1
+    dpo_loss_type: str = "sigmoid"
+    dpo_label_smoothing: float = 0.0
+    simpo_gamma: float = 0.5
+
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING

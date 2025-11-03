@@ -5,6 +5,12 @@
 
 actor_rollout_ref:
   actor:
+    use_dpo_loss: true
+    dpo_coef: 0.5
+    dpo_beta: 0.1
+    dpo_loss_type: sigmoid
+    dpo_label_smoothing: 0.0
+    simpo_gamma: 0.5
     optim:
       _target_: verl.workers.config.FSDPOptimizerConfig
       lr: 1.0e-06

@@ -209,7 +209,10 @@ class RLHFDataset(Dataset):
         return len(self.dataframe)
 
     def _build_messages(self, example: dict):
-        prompt: list = example.pop(self.prompt_key)
+        prompt = example.pop(self.prompt_key)
+        if isinstance(prompt, list):
+            prompt = prompt[0]["content"]
+            print("prompt", prompt)
         messages = [{"role": 'system', "content": self.system_prompt},{"role": "user", "content": prompt}]
         if self.image_key in example or self.video_key in example:
             for message in messages:
@@ -236,7 +239,7 @@ class RLHFDataset(Dataset):
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}
-
+        
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 

@@ -44,6 +44,85 @@ __all__ = ["DataParallelPPOActor"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# ---- Add near the top (helpers) ----
+import torch.nn.functional as F
+
+
+
+
+def _dpo_loss(chosen_logps: torch.Tensor,
+              rejected_logps: torch.Tensor,
+              chosen_labels: torch.LongTensor,
+              rejected_labels: torch.LongTensor,
+              beta: float,
+              loss_type: str = "sigmoid",
+              label_smoothing: float = 0.0,
+              simpo_gamma: float = 0.5
+              ) -> torch.Tensor:
+    """Standard DPO: mean over pairs."""
+
+    def _dpo_get_batch_logps(scores: torch.Tensor,
+                            labels: torch.LongTensor,
+                            average_log_prob: bool = False) -> torch.FloatTensor:
+        """
+        Compute sequence log-probs on response tokens (labels=-100 are ignored).
+
+        Accepts:
+        - scores: [B, S, V] (logits or log-probs per vocab)  -> we log_softmax and gather
+        - scores: [B, S]   (already label-selected log-probs per step)
+        Returns:
+        - seq_logps: [B]
+        """
+        if scores.dim() not in (2, 3):
+            raise ValueError(f"scores must be rank-2 or rank-3, got {scores.dim()}")
+
+        labels = labels.contiguous().to(scores.device)
+        # print("labels", labels.shape)
+        if scores.dim() == 3:
+            # Per-vocab scores: align next-token prediction
+            # Shift along sequence: predict token t from position t-1
+            shift_scores = scores[..., :-1, :].contiguous()             # [B, S-1, V]
+            shift_labels = labels[..., 1:].contiguous()                  # [B, S-1]
+            # Convert to log-probs and gather gold tokens
+            logp_per_tok = shift_scores.log_softmax(dim=-1).gather(
+                dim=-1, index=shift_labels.unsqueeze(-1)
+            ).squeeze(-1)                                               # [B, S-1]
+            mask = (shift_labels != -100)
+        else:
+            # Already label-selected log-probs per position
+            shift_logps = scores[..., 1:].contiguous()                   # [B, S-1]
+            shift_labels = labels[..., 1:].contiguous()                  # [B, S-1]
+            mask = (shift_labels != -100)
+            logp_per_tok = shift_logps * mask                            # [B, S-1]
+
+        seq_logps = (logp_per_tok * mask).sum(dim=-1)                    # [B]
+        if average_log_prob:
+            denom = torch.clamp(mask.sum(dim=-1), min=1)
+            seq_logps = seq_logps / denom
+        return seq_logps
+
+    policy_chosen_logps = _dpo_get_batch_logps(chosen_logps, chosen_labels, average_log_prob=loss_type in ["ipo", "simpo"],)
+    policy_rejected_logps = _dpo_get_batch_logps(rejected_logps, rejected_labels, average_log_prob=loss_type in ["ipo", "simpo"],)
+    
+    logits = policy_chosen_logps - policy_rejected_logps
+    if loss_type == "sigmoid":
+        # label smoothing on pairwise preference
+        return (-F.logsigmoid(beta * logits) * (1 - label_smoothing)
+                - F.logsigmoid(-beta * logits) * label_smoothing).mean()
+    elif loss_type == "ipo":
+        return ((logits - 1.0 / (2.0 * beta)) ** 2).mean()
+    elif loss_type == "simpo":
+        gamma_logratios = simpo_gamma / beta
+        logits = logits - gamma_logratios
+        # This reduces to Equation 3 from the CPO paper when label_smoothing -> 0.
+        losses = (
+            -F.logsigmoid(beta * logits) * (1 - label_smoothing)
+            - F.logsigmoid(-beta * logits) * label_smoothing
+        ).mean()
+    elif loss_type == "hinge":
+        return torch.relu(1 - beta * logits).mean()
+    else:
+        raise ValueError(f"Unknown dpo loss_type: {loss_type}")
 
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
@@ -357,6 +436,16 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+
+        # --- config knobs for DPO ---
+        use_dpo = self.config["use_dpo_loss"] 
+        dpo_coef = self.config["dpo_coef"] 
+        dpo_beta =  self.config["dpo_beta"] 
+        dpo_loss_type =  self.config["dpo_loss_type"] 
+        dpo_label_smoothing =  self.config["dpo_label_smoothing"] 
+        simpo_gamma =  self.config["simpo_gamma"] 
+        
+        response_length = data.batch["responses"].size(-1)
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -380,6 +469,31 @@ class DataParallelPPOActor(BasePPOActor):
                 "and is not currently supported in Server mode (agent loop)."
             )
             select_keys.append("rollout_log_probs")
+
+
+
+        # ---- Extra keys for DPO (we build chosen=GT and rejected=generated) ----
+        if use_dpo:
+            # either you provide explicit chosen_* / rejected_*,
+            # or we derive them from full_input_ids/full_attention_mask vs input_ids/attention_mask
+            explicit_keys = [
+                "chosen_input_ids", "chosen_attention_mask", "chosen_position_ids",
+                "chosen_labels", "rejected_input_ids", "rejected_attention_mask",
+                "rejected_position_ids", "rejected_labels",
+            ]
+            has_explicit = all(k in data.batch for k in ["chosen_input_ids", "rejected_input_ids"])
+            if has_explicit:
+                select_keys.extend([k for k in explicit_keys if k in data.batch])
+            else:
+                # Expect full_* for ground-truth (chosen)
+                select_keys.extend(["full_input_ids", "full_attention_mask"])
+                # position ids optional
+                if "full_position_ids" in data.batch:
+                    select_keys.append("full_position_ids")
+
+
+
+
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -471,11 +585,91 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    loss = policy_loss
+                    
+
+                    if use_dpo:
+                        # try explicit chosen/rejected; otherwise derive from full_* vs generated
+
+                        ch_ids = model_inputs["chosen_input_ids"]
+                        ch_mask = model_inputs["chosen_attention_mask"]
+                        ch_pos  = model_inputs["chosen_position_ids"]
+                        ch_lbls = model_inputs["chosen_labels"]
+                        rj_ids = model_inputs["rejected_input_ids"]
+                        rj_mask = model_inputs["rejected_attention_mask"]
+                        rj_pos  = model_inputs["rejected_position_ids"]
+                        rj_lbls = model_inputs["rejected_labels"]
+
+                        # Handle Qwen2VL-style MRoPE position_ids if present
+                        if ch_pos is not None:
+                            if ch_pos.dim() == 3:
+                                # (bsz, 4, seqlen) -> (4, bsz, seqlen) AND make contiguous
+                                ch_pos = ch_pos.transpose(0, 1).contiguous()
+                            else:
+                                ch_pos = ch_pos.contiguous()
+                            # qwen models expect long
+                            ch_pos = ch_pos.to(torch.long)
+
+                        if rj_pos is not None:
+                            if rj_pos.dim() == 3:
+                                rj_pos = rj_pos.transpose(0, 1).contiguous()
+                            else:
+                                rj_pos = rj_pos.contiguous()
+                            rj_pos = rj_pos.to(torch.long)
+
+                        # multi-modal inputs (optional)
+                        mm_inputs = {}
+                        if "multi_modal_inputs" in model_inputs:
+                            from verl.utils.model import extract_multi_modal_inputs
+                            mm_inputs = extract_multi_modal_inputs(model_inputs["multi_modal_inputs"])
+                        # print("ch_ids", ch_ids.shape)
+                        # print("rj_ids", rj_ids.shape)
+                        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                            ch_out = self.actor_module(
+                                input_ids=ch_ids, attention_mask=ch_mask, position_ids=ch_pos,
+                                **mm_inputs, use_cache=False, return_dict=True
+                            )
+                            rj_out = self.actor_module(
+                                input_ids=rj_ids, attention_mask=rj_mask, position_ids=rj_pos,
+                                **mm_inputs, use_cache=False, return_dict=True
+                            )
+                            # print("ch_out", ch_out)
+                            # print("rj_out", rj_out)
+                        if self.use_fused_kernels:
+                            ch_log_probs = ch_out.log_probs
+                            rj_log_probs = rj_out.log_probs
+                            # print("ch_log_probs", ch_log_probs.shape)
+                            # print("rj_log_probs", rj_log_probs.shape)
+                            
+                            # ch_logits = ch_logits[:, -response_length - 1 : -1]
+                            # rj_logits = rj_logits[:, -response_length - 1 : -1]
+
+                            # print("ch_logits", ch_logits.shape)
+                            # print("rj_logits", rj_logits.shape)
+                        else:
+                            raise NotImplementedError
+
+
+                        dpo_loss = _dpo_loss(
+                            chosen_logps=ch_log_probs,
+                            rejected_logps=rj_log_probs,
+                            chosen_labels=ch_lbls,
+                            rejected_labels=rj_lbls,
+                            beta=dpo_beta,
+                            loss_type=dpo_loss_type,
+                            label_smoothing=dpo_label_smoothing,
+                            simpo_gamma=simpo_gamma
+                        )
+                        loss = loss + dpo_coef * dpo_loss                    
+                    
+                    
+                    
+                    
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
+                        loss = loss * loss_scale_factor
                     else:
-                        loss = policy_loss * loss_scale_factor
+                        loss = loss * loss_scale_factor
                     loss.backward()
 
                     micro_batch_metrics.update(
@@ -486,6 +680,9 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+                    if use_dpo:
+                        micro_batch_metrics["actor/dpo_loss"] = dpo_loss.detach().item()
+                        micro_batch_metrics["actor/dpo_coef"] = dpo_coef                    
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

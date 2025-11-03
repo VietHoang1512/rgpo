@@ -38,12 +38,13 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     assert_pkg_version,
-    get_ip,
+    # get_ip,
     get_open_port,
     is_cuda,
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils import get_local_ip_auto as get_ip
 from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh

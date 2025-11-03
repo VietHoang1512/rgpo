@@ -1,18 +1,19 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:2 -C 'a100|h100'
+#SBATCH --gres=gpu:1 -C 'a100|h100'
 #SBATCH --time=48:00:00
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=200GB
+#SBATCH --mem=100GB
 #SBATCH --job-name=sp
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
+#SBATCH --account=pr_95_tandon_advanced
 # set -x
 module purge
 module load anaconda3/2020.07
 eval "$(conda shell.bash hook)"
-conda activate /vast/hvp2011/h_envs/self_play
+conda activate /vast/hvp2011/h_envs/verl
 conda env list
 nvidia-smi
 # unset PYTHONPATH
@@ -29,6 +30,9 @@ export HYDRA_FULL_ERROR=1
 # pip install -e /scratch/hvp2011/implement/self_play/MathRuler
 # pip install flash-attn --no-build-isolation
 # pip install uvloop==0.21.0
+export HF_TOKEN=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
+export WANDB_API_KEY="8e206762de4253cfbf4fd8db344147e420be8b78"
+export HYDRA_FULL_ERROR=1 
 unset ROCR_VISIBLE_DEVICES
 ENGINE=${1:-vllm}
 # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
@@ -107,18 +111,22 @@ system_prompt="You are a helpful assistant. When responding to any user query, f
 
 prompt=optimal
 system_prompt="You first think through the reasoning process as an internal monologue, enclosed within <think> </think> tags. Then, provide your final answer enclosed within \boxed{}."
-custom_reward_function=/scratch/hvp2011/implement/self_play/verl/verl/utils/reward_score/math_ruler.py
+custom_reward_function=./verl/verl/utils/reward_score/math_ruler.py
 
-prompt=suboptimal
-system_prompt="/scratch/hvp2011/implement/self_play/prompts/mint.txt"
-custom_reward_function=/scratch/hvp2011/implement/self_play/verl/verl/utils/reward_score/math_mint.py
+prompt=mint-long
+prompt=mint-short
 
+system_prompt="./prompts/$prompt.txt"
+custom_reward_function=./verl/verl/utils/reward_score/math_mint.py
 
 
 adv_estimator=grpo
 # adv_estimator=reinforce_plus_plus
 
-experiment_name="qwen25-3b-mint-mathvista-$prompt-$adv_estimator-$USER-0"
+# model=Qwen2-VL-2B-Instruct
+model=Qwen2.5-VL-3B-Instruct
+model=Qwen2.5-VL-7B-Instruct
+experiment_name="mint-mathvista-$model-$prompt-$adv_estimator-$USER-000"
 # experiment_name=test
 export LOG_PATH=outputs/$experiment_name.log
 CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
@@ -126,14 +134,20 @@ CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
     data.train_files=data/mint_cot_r1.parquet \
     data.val_files=data/mathvista_mini.parquet \
     data.train_batch_size=128 \
-    data.max_prompt_length=2048 \
-    data.max_response_length=4096 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=64 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    data.max_prompt_length=512 \
+    data.max_response_length=1024 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.actor.strategy="fsdp2" \
+    actor_rollout_ref.actor.use_dpo_loss=True \
+    actor_rollout_ref.actor.dpo_coef=0.1 \
+    actor_rollout_ref.actor.dpo_beta=0.1 \
+    actor_rollout_ref.actor.dpo_loss_type=simpo \
+    actor_rollout_ref.actor.simpo_gamma=0.5 \
+    actor_rollout_ref.actor.dpo_label_smoothing=0.0 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.image_key=image \
@@ -142,7 +156,7 @@ CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
     "data.system_prompt='${system_prompt}'" \
     reward_model.enable=False \
     custom_reward_function.path=$custom_reward_function \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-VL-3B-Instruct \
+    actor_rollout_ref.model.path=Qwen/$model \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=True \
@@ -156,7 +170,7 @@ CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.name=$ENGINE \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=True \
@@ -167,7 +181,7 @@ CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='rgpo' \
+    trainer.project_name='rgpo-0' \
     trainer.experiment_name=$experiment_name \
     trainer.validation_data_dir=outputs/$experiment_name \
     trainer.rollout_data_dir=outputs/$experiment_name \

@@ -1110,20 +1110,27 @@ class RayRGPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
 
+                        # compute advantages, executed on the driver process
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                            "norm_adv_by_std_in_grpo", True
+                        )  # GRPO adv normalization factor
 
-                        # --- Prepare DPO Batch ---
-                        dpo_update_batch_proto = None  # Initialize
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
+
                         with marked_timer("prepare_dpo_batch", timing_raw):
                             try:
-                                if "preferences" not in batch.batch or batch.batch["preferences"] is None:
-                                    raise ValueError("'preferences' key missing or None after compute_onlineDPO_pref.")
 
-                                # Check if reference log probs were computed successfully (if needed)
-                                if ref_log_prob_computed:
-                                    raise ValueError("Reference log probs required but failed to compute.")
 
                                 # Check required base keys
-                                required_keys = ["input_ids", "attention_mask", "response_mask"]
+                                required_keys = ["full_input_ids", "full_attention_mask", "input_ids", "attention_mask", "response_mask"]
                                 for rk in required_keys:
                                     if rk not in batch.batch or batch.batch[rk] is None:
                                         raise KeyError(f"Required key '{rk}' missing from batch for DPO prep.")
@@ -1141,7 +1148,7 @@ class RayRGPOTrainer:
                                     else None
                                 )
                                 rejected_position_ids = (
-                                    batch.batch.get("position_ids")[not_preferences_mask]
+                                    batch.batch.get("position_ids")
                                     if "position_ids" in batch.batch
                                     else None
                                 )
@@ -1153,79 +1160,31 @@ class RayRGPOTrainer:
                                 chosen_labels[:, :prompt_len] = -100
                                 rejected_labels = rejected_input_ids.clone()
                                 rejected_labels[:, :prompt_len] = -100
-
-                                # Calculate and Gather Reference Log Probs (Sequence Level)
-                                ref_log_prob_tensor = batch.batch["ref_log_prob"]  # Token level [bsz * n, seq_len]
-                                response_mask_full = batch.batch[
-                                    "response_mask"
-                                ]  # Response mask [bsz * n, seq_len]
-                                ref_sequence_logps = (ref_log_prob_tensor * response_mask_full).sum(
-                                    dim=-1
-                                )  # Sequence level [bsz * n]
-                                reference_chosen_logps = ref_sequence_logps[preferences_mask]
-                                reference_rejected_logps = ref_sequence_logps[not_preferences_mask]
-
+                                # print("chosen_input_ids", chosen_input_ids.shape)
+                                # print("chosen_attention_mask", chosen_attention_mask.shape)
+                                # print("chosen_labels", chosen_labels.shape)
+                                # print("rejected_input_ids", rejected_input_ids.shape)
+                                # print("rejected_attention_mask", rejected_attention_mask.shape)
+                                # print("rejected_labels", rejected_labels.shape)
                                 # Package Tensors
-                                dpo_tensors = {
-                                    "chosen_input_ids": chosen_input_ids,
-                                    "chosen_attention_mask": chosen_attention_mask,
-                                    "chosen_labels": chosen_labels,
-                                    "rejected_input_ids": rejected_input_ids,
-                                    "rejected_attention_mask": rejected_attention_mask,
-                                    "rejected_labels": rejected_labels,
-                                }
+                                # Update the batch with the DPO fields.  These keys will
+                                # be consumed by ``update_policy`` on the actor.
+                                batch.batch["chosen_input_ids"] = chosen_input_ids
+                                batch.batch["chosen_attention_mask"] = chosen_attention_mask
+                                batch.batch["chosen_labels"] = chosen_labels
+                                batch.batch["rejected_input_ids"] = rejected_input_ids
+                                batch.batch["rejected_attention_mask"] = rejected_attention_mask
+                                batch.batch["rejected_labels"] = rejected_labels
                                 # Conditionally add reference logps if computed
-                                if reference_chosen_logps is not None:
-                                    dpo_tensors["reference_chosen_logps"] = reference_chosen_logps
-                                if reference_rejected_logps is not None:
-                                    dpo_tensors["reference_rejected_logps"] = reference_rejected_logps
-                                # Add position ids if they exist
                                 if chosen_position_ids is not None:
-                                    dpo_tensors["chosen_position_ids"] = chosen_position_ids
+                                    batch.batch["chosen_position_ids"] = chosen_position_ids
                                 if rejected_position_ids is not None:
-                                    dpo_tensors["rejected_position_ids"] = rejected_position_ids
-                                print("dpo_tensors", dpo_tensors)
-                                for k, v in dpo_tensors.items():
-                                    print(k, v.shape)
-                                # Prepare Meta Info
-                                dpo_meta = {
-                                    "dpo_beta": OmegaConf.select(self.config.algorithm, "dpo_beta", default=0.1),
-                                    "dpo_loss_type": OmegaConf.select(
-                                        self.config.algorithm, "dpo_loss_type", default="sigmoid"
-                                    ),
-                                    "dpo_label_smoothing": OmegaConf.select(
-                                        self.config.algorithm, "dpo_label_smoothing", default=0.0
-                                    ),
-                                    "use_reference_policy": True,
-                                    "reference_free": False,  # False if using external ref
-                                    "global_step": self.global_steps,
-                                }
-                                print("dpo_meta", dpo_meta)
-                                dpo_update_batch_proto = DataProto.from_dict(tensors=dpo_tensors, meta_info=dpo_meta)
-                                # print(f"---- [Step {self.global_steps}] DEBUG DPO: Prepared DPO Update Batch ----")
-                                # print(f"  Keys: {list(dpo_update_batch_proto.batch.keys())}")
-                                # print(f"  Meta Info: {dpo_meta}")
+                                    batch.batch["rejected_position_ids"] = rejected_position_ids
 
                             except Exception as e_prep:
                                 print(f"ERROR preparing DPO batch at step {self.global_steps}: {e_prep}")
-                                traceback.print_exc()
-                                dpo_update_batch_proto = None  # Skip update on error
 
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
 
                     # update critic
                     if self.use_critic:
