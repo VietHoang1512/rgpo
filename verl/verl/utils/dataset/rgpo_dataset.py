@@ -20,6 +20,7 @@ import os
 import re
 from collections import defaultdict
 from typing import Optional
+from pathlib import Path
 
 import datasets
 import numpy as np
@@ -105,11 +106,8 @@ class RGPODataset(Dataset):
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.system_prompt = config.get("system_prompt", "You are a helpful assistant")
-        try:
-            from pathlib import Path
-            self.system_prompt = Path(self.system_prompt.strip()).read_text(encoding="utf-8")
-        except:
-            pass
+        self.system_prompt = Path(self.system_prompt.strip()).read_text(encoding="utf-8")
+        
         print("system_prompt", {self.system_prompt})
         
         self.return_raw_chat = config.get("return_raw_chat", False)

@@ -79,6 +79,7 @@ def _dpo_loss(chosen_logps: torch.Tensor,
         labels = labels.contiguous().to(scores.device)
         # print("labels", labels.shape)
         if scores.dim() == 3:
+            raise ValueError
             # Per-vocab scores: align next-token prediction
             # Shift along sequence: predict token t from position t-1
             shift_scores = scores[..., :-1, :].contiguous()             # [B, S-1, V]
@@ -107,22 +108,26 @@ def _dpo_loss(chosen_logps: torch.Tensor,
     logits = policy_chosen_logps - policy_rejected_logps
     if loss_type == "sigmoid":
         # label smoothing on pairwise preference
-        return (-F.logsigmoid(beta * logits) * (1 - label_smoothing)
+        loss = (-F.logsigmoid(beta * logits) * (1 - label_smoothing)
                 - F.logsigmoid(-beta * logits) * label_smoothing).mean()
     elif loss_type == "ipo":
-        return ((logits - 1.0 / (2.0 * beta)) ** 2).mean()
+        loss =  ((logits - 1.0 / (2.0 * beta)) ** 2).mean()
     elif loss_type == "simpo":
         gamma_logratios = simpo_gamma / beta
         logits = logits - gamma_logratios
         # This reduces to Equation 3 from the CPO paper when label_smoothing -> 0.
-        losses = (
+        loss = (
             -F.logsigmoid(beta * logits) * (1 - label_smoothing)
             - F.logsigmoid(-beta * logits) * label_smoothing
         ).mean()
     elif loss_type == "hinge":
-        return torch.relu(1 - beta * logits).mean()
+        loss =  torch.relu(1 - beta * logits).mean()
     else:
         raise ValueError(f"Unknown dpo loss_type: {loss_type}")
+    chosen_rewards = beta * (policy_chosen_logps).detach()
+    rejected_rewards = beta * (policy_rejected_logps).detach()
+
+    return loss, chosen_rewards, rejected_rewards
 
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
@@ -161,6 +166,15 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+
+
+        # --- config knobs for DPO ---
+        self.use_dpo = self.config["use_dpo_loss"] 
+        self.dpo_coef = self.config["dpo_coef"] 
+        self.dpo_beta =  self.config["dpo_beta"] 
+        self.dpo_loss_type =  self.config["dpo_loss_type"] 
+        self.dpo_label_smoothing =  self.config["dpo_label_smoothing"] 
+        self.simpo_gamma =  self.config["simpo_gamma"] 
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -437,13 +451,7 @@ class DataParallelPPOActor(BasePPOActor):
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
 
-        # --- config knobs for DPO ---
-        use_dpo = self.config["use_dpo_loss"] 
-        dpo_coef = self.config["dpo_coef"] 
-        dpo_beta =  self.config["dpo_beta"] 
-        dpo_loss_type =  self.config["dpo_loss_type"] 
-        dpo_label_smoothing =  self.config["dpo_label_smoothing"] 
-        simpo_gamma =  self.config["simpo_gamma"] 
+
         
         response_length = data.batch["responses"].size(-1)
         # make sure we are in training mode
@@ -473,7 +481,7 @@ class DataParallelPPOActor(BasePPOActor):
 
 
         # ---- Extra keys for DPO (we build chosen=GT and rejected=generated) ----
-        if use_dpo:
+        if self.use_dpo:
             # either you provide explicit chosen_* / rejected_*,
             # or we derive them from full_input_ids/full_attention_mask vs input_ids/attention_mask
             explicit_keys = [
@@ -481,15 +489,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "chosen_labels", "rejected_input_ids", "rejected_attention_mask",
                 "rejected_position_ids", "rejected_labels",
             ]
-            has_explicit = all(k in data.batch for k in ["chosen_input_ids", "rejected_input_ids"])
-            if has_explicit:
-                select_keys.extend([k for k in explicit_keys if k in data.batch])
-            else:
-                # Expect full_* for ground-truth (chosen)
-                select_keys.extend(["full_input_ids", "full_attention_mask"])
-                # position ids optional
-                if "full_position_ids" in data.batch:
-                    select_keys.append("full_position_ids")
+            select_keys.extend([k for k in explicit_keys if k in data.batch])
 
 
 
@@ -588,13 +588,14 @@ class DataParallelPPOActor(BasePPOActor):
                     loss = policy_loss
                     
 
-                    if use_dpo:
+                    if self.use_dpo:
                         # try explicit chosen/rejected; otherwise derive from full_* vs generated
 
                         ch_ids = model_inputs["chosen_input_ids"]
                         ch_mask = model_inputs["chosen_attention_mask"]
                         ch_pos  = model_inputs["chosen_position_ids"]
                         ch_lbls = model_inputs["chosen_labels"]
+                        
                         rj_ids = model_inputs["rejected_input_ids"]
                         rj_mask = model_inputs["rejected_attention_mask"]
                         rj_pos  = model_inputs["rejected_position_ids"]
@@ -622,24 +623,26 @@ class DataParallelPPOActor(BasePPOActor):
                         if "multi_modal_inputs" in model_inputs:
                             from verl.utils.model import extract_multi_modal_inputs
                             mm_inputs = extract_multi_modal_inputs(model_inputs["multi_modal_inputs"])
-                        # print("ch_ids", ch_ids.shape)
-                        # print("rj_ids", rj_ids.shape)
+                        extra_args = {}
+                        if self.use_fused_kernels:
+                            extra_args["temperature"] = temperature
+                            extra_args["return_dict"] = True
                         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
                             ch_out = self.actor_module(
                                 input_ids=ch_ids, attention_mask=ch_mask, position_ids=ch_pos,
-                                **mm_inputs, use_cache=False, return_dict=True
+                                **mm_inputs, use_cache=False, **extra_args,
                             )
                             rj_out = self.actor_module(
                                 input_ids=rj_ids, attention_mask=rj_mask, position_ids=rj_pos,
-                                **mm_inputs, use_cache=False, return_dict=True
+                                **mm_inputs, use_cache=False, **extra_args,
                             )
                             # print("ch_out", ch_out)
                             # print("rj_out", rj_out)
                         if self.use_fused_kernels:
                             ch_log_probs = ch_out.log_probs
                             rj_log_probs = rj_out.log_probs
-                            # print("ch_log_probs", ch_log_probs.shape)
-                            # print("rj_log_probs", rj_log_probs.shape)
+                            print("ch_log_probs", ch_log_probs.shape, ch_log_probs)
+                            print("rj_log_probs", rj_log_probs.shape, rj_log_probs)
                             
                             # ch_logits = ch_logits[:, -response_length - 1 : -1]
                             # rj_logits = rj_logits[:, -response_length - 1 : -1]
@@ -650,18 +653,18 @@ class DataParallelPPOActor(BasePPOActor):
                             raise NotImplementedError
 
 
-                        dpo_loss = _dpo_loss(
+                        dpo_loss, chosen_rewards, rejected_rewards = _dpo_loss(
                             chosen_logps=ch_log_probs,
                             rejected_logps=rj_log_probs,
                             chosen_labels=ch_lbls,
                             rejected_labels=rj_lbls,
-                            beta=dpo_beta,
-                            loss_type=dpo_loss_type,
-                            label_smoothing=dpo_label_smoothing,
-                            simpo_gamma=simpo_gamma
+                            beta=self.dpo_beta,
+                            loss_type=self.dpo_loss_type,
+                            label_smoothing=self.dpo_label_smoothing,
+                            simpo_gamma=self.simpo_gamma
                         )
-                        loss = loss + dpo_coef * dpo_loss                    
-                    
+                        loss = loss + self.dpo_coef * dpo_loss                    
+                        
                     
                     
                     
@@ -680,9 +683,12 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
-                    if use_dpo:
+                    if self.use_dpo:
                         micro_batch_metrics["actor/dpo_loss"] = dpo_loss.detach().item()
-                        micro_batch_metrics["actor/dpo_coef"] = dpo_coef                    
+                        micro_batch_metrics["actor/dpo_chosen_rewards"]  =  chosen_rewards.mean().item()
+                        micro_batch_metrics["actor/dpo_rejected_rewards"]  =  rejected_rewards.mean().item()
+                        micro_batch_metrics["actor/reward_accuracies"] = (chosen_rewards > rejected_rewards).float().mean().item()
+                        
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

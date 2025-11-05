@@ -339,7 +339,7 @@ class RayRGPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-
+        self.use_dpo_loss = config.actor_rollout_ref.actor.use_dpo_loss 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -1059,7 +1059,7 @@ class RayRGPOTrainer:
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         
-                        print("old_log_prob", old_log_prob)
+                        # print("old_log_prob", old_log_prob)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1124,65 +1124,68 @@ class RayRGPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-
-                        with marked_timer("prepare_dpo_batch", timing_raw):
-                            try:
-
-
-                                # Check required base keys
-                                required_keys = ["full_input_ids", "full_attention_mask", "input_ids", "attention_mask", "response_mask"]
-                                for rk in required_keys:
-                                    if rk not in batch.batch or batch.batch[rk] is None:
-                                        raise KeyError(f"Required key '{rk}' missing from batch for DPO prep.")
+                        if self.use_dpo_loss:
+                            with marked_timer("prepare_dpo_batch", timing_raw):
+                                try:
 
 
+                                    # Check required base keys
+                                    required_keys = ["full_input_ids", "full_attention_mask", "input_ids", "attention_mask", "response_mask"]
+                                    for rk in required_keys:
+                                        if rk not in batch.batch or batch.batch[rk] is None:
+                                            raise KeyError(f"Required key '{rk}' missing from batch for DPO prep.")
 
-                                # Gather Chosen/Rejected Base Tensors
-                                chosen_input_ids = batch.batch["full_input_ids"]
-                                chosen_attention_mask = batch.batch["full_attention_mask"]
-                                rejected_input_ids = batch.batch["input_ids"]
-                                rejected_attention_mask = batch.batch["attention_mask"]
-                                chosen_position_ids = (
-                                    batch.batch.get("full_position_ids")
-                                    if "position_ids" in batch.batch
-                                    else None
-                                )
-                                rejected_position_ids = (
-                                    batch.batch.get("position_ids")
-                                    if "position_ids" in batch.batch
-                                    else None
-                                )
 
-                                # Create Labels
-                                print("WARNING: Creating DPO labels using configured max_prompt_length...")
-                                prompt_len = self.config.data.max_prompt_length
-                                chosen_labels = chosen_input_ids.clone()
-                                chosen_labels[:, :prompt_len] = -100
-                                rejected_labels = rejected_input_ids.clone()
-                                rejected_labels[:, :prompt_len] = -100
-                                # print("chosen_input_ids", chosen_input_ids.shape)
-                                # print("chosen_attention_mask", chosen_attention_mask.shape)
-                                # print("chosen_labels", chosen_labels.shape)
-                                # print("rejected_input_ids", rejected_input_ids.shape)
-                                # print("rejected_attention_mask", rejected_attention_mask.shape)
-                                # print("rejected_labels", rejected_labels.shape)
-                                # Package Tensors
-                                # Update the batch with the DPO fields.  These keys will
-                                # be consumed by ``update_policy`` on the actor.
-                                batch.batch["chosen_input_ids"] = chosen_input_ids
-                                batch.batch["chosen_attention_mask"] = chosen_attention_mask
-                                batch.batch["chosen_labels"] = chosen_labels
-                                batch.batch["rejected_input_ids"] = rejected_input_ids
-                                batch.batch["rejected_attention_mask"] = rejected_attention_mask
-                                batch.batch["rejected_labels"] = rejected_labels
-                                # Conditionally add reference logps if computed
-                                if chosen_position_ids is not None:
-                                    batch.batch["chosen_position_ids"] = chosen_position_ids
-                                if rejected_position_ids is not None:
-                                    batch.batch["rejected_position_ids"] = rejected_position_ids
 
-                            except Exception as e_prep:
-                                print(f"ERROR preparing DPO batch at step {self.global_steps}: {e_prep}")
+                                    # Gather Chosen/Rejected Base Tensors
+                                    chosen_input_ids = batch.batch["full_input_ids"]
+                                    chosen_attention_mask = batch.batch["full_attention_mask"]
+                                    rejected_input_ids = batch.batch["input_ids"]
+                                    rejected_attention_mask = batch.batch["attention_mask"]
+                                    chosen_position_ids = (
+                                        batch.batch.get("full_position_ids")
+                                        if "position_ids" in batch.batch
+                                        else None
+                                    )
+                                    rejected_position_ids = (
+                                        batch.batch.get("position_ids")
+                                        if "position_ids" in batch.batch
+                                        else None
+                                    )
+
+                                    # Create Labels
+                                    print("WARNING: Creating DPO labels using configured max_prompt_length...")
+                                    prompt_len = self.config.data.max_prompt_length
+                                    chosen_labels = chosen_input_ids.clone()
+                                    chosen_labels[:, :prompt_len] = -100
+                                    rejected_labels = rejected_input_ids.clone()
+                                    rejected_labels[:, :prompt_len] = -100
+                                    print("chosen_input_ids", chosen_input_ids.shape)
+                                    print("chosen_attention_mask", chosen_attention_mask.shape)
+                                    print("chosen_labels", chosen_labels.shape)
+                                    print("rejected_input_ids", rejected_input_ids.shape)
+                                    print("rejected_attention_mask", rejected_attention_mask.shape)
+                                    print("rejected_labels", rejected_labels.shape)
+                                    # Package Tensors
+                                    # Update the batch with the DPO fields.  These keys will
+                                    # be consumed by ``update_policy`` on the actor.
+                                    batch.batch["chosen_input_ids"] = chosen_input_ids
+                                    batch.batch["chosen_attention_mask"] = chosen_attention_mask
+                                    batch.batch["chosen_labels"] = chosen_labels
+
+                                                                        
+                                    batch.batch["rejected_input_ids"] = rejected_input_ids
+                                    batch.batch["rejected_attention_mask"] = rejected_attention_mask
+                                    batch.batch["rejected_labels"] = rejected_labels
+                                    # Conditionally add reference logps if computed
+                                    if chosen_position_ids is not None:
+                                        batch.batch["chosen_position_ids"] = chosen_position_ids
+                                    if rejected_position_ids is not None:
+                                        batch.batch["rejected_position_ids"] = rejected_position_ids
+
+
+                                except Exception as e_prep:
+                                    print(f"ERROR preparing DPO batch at step {self.global_steps}: {e_prep}")
 
 
 
