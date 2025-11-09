@@ -184,7 +184,7 @@ class RGPODataset(Dataset):
 
                 resp_text = doc.get(self.response_key, None)
                 if isinstance(resp_text, str) and len(resp_text) > 0:
-                    full_messages = messages + [{"role": "assistant", "content": resp_text}]
+                    full_messages = messages + [{"role": "assistant", "content":{"type": "text", "text":resp_text}}]
                     full_text = self.processor.apply_chat_template(
                         full_messages, add_generation_prompt=False, tokenize=False, **self.apply_chat_template_kwargs
                     )
@@ -193,6 +193,7 @@ class RGPODataset(Dataset):
                     full_len = None
 
             else:
+                # print("messages", messages)
                 raw_prompt = tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
                 )
@@ -220,13 +221,13 @@ class RGPODataset(Dataset):
                 return False
             return True
 
-        dataframe = dataframe.filter(
+        new_dataframe = dataframe.filter(
             _keep,
             num_proc=self.num_workers,
             desc=f"Filtering prompts>{self.max_prompt_length} and full>{total_max} tokens",
         )
-        print(f"filter dataset len: {len(dataframe)}")
-        return dataframe
+        print(f"filter dataset len: {len(new_dataframe)}/{len(dataframe)}")
+        return new_dataframe
 
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_files")
@@ -249,18 +250,19 @@ class RGPODataset(Dataset):
         if self.image_key in example or self.video_key in example:
             for message in messages:
                 content = message["content"]
-                content_list = []
-                segments = re.split("(<image>|<video>)", content)
-                segments = [item for item in segments if item != ""]
-                for segment in segments:
-                    if segment == "<image>":
-                        content_list.append({"type": "image"})
-                    elif segment == "<video>":
-                        content_list.append({"type": "video"})
-                    else:
-                        content_list.append({"type": "text", "text": segment})
+                if self.processor is not None:
+                    content_list = []
+                    segments = re.split("(<image>|<video>)", content)
+                    segments = [item for item in segments if item != ""]
+                    for segment in segments:
+                        if segment == "<image>":
+                            content_list.append({"type": "image"})
+                        elif segment == "<video>":
+                            content_list.append({"type": "video"})
+                        else:
+                            content_list.append({"type": "text", "text": segment})
 
-                message["content"] = content_list
+                    message["content"] = content_list
 
         return messages
 
@@ -271,7 +273,11 @@ class RGPODataset(Dataset):
         row_dict: dict = self.dataframe[item]
         resp_text = row_dict[self.response_key]
         messages = self._build_messages(row_dict)
-        full_messages = messages + [{"role": "assistant", "content": resp_text}]
+        if self.processor is not None:
+            full_messages = messages + [{"role": "assistant", "content": {"type": "text", "text":resp_text}}]
+        else:
+            full_messages = messages + [{"role": "assistant", "content": resp_text}]
+            
         model_inputs = {}
         images, videos = None, None
         if self.processor is not None:

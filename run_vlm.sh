@@ -8,7 +8,6 @@
 #SBATCH --job-name=sp
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
-#SBATCH --account=pr_95_tandon_advanced
 # set -x
 module purge
 module load anaconda3/2020.07
@@ -30,7 +29,6 @@ export HYDRA_FULL_ERROR=1
 # pip install -e /scratch/hvp2011/implement/self_play/MathRuler
 # pip install flash-attn --no-build-isolation
 # pip install uvloop==0.21.0
-export HF_TOKEN=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
 export WANDB_API_KEY="8e206762de4253cfbf4fd8db344147e420be8b78"
 export HYDRA_FULL_ERROR=1 
 unset ROCR_VISIBLE_DEVICES
@@ -114,19 +112,24 @@ system_prompt="You first think through the reasoning process as an internal mono
 custom_reward_function=./verl/verl/utils/reward_score/math_ruler.py
 
 prompt=mint-long
-prompt=mint-short
+# prompt=mint-short
 
 system_prompt="./prompts/$prompt.txt"
 custom_reward_function=./verl/verl/utils/reward_score/math_mint.py
 
 
 adv_estimator=grpo
-# adv_estimator=reinforce_plus_plus
+adv_estimator=reinforce_plus_plus
 
-# model=Qwen2-VL-2B-Instruct
+model=Qwen2-VL-2B-Instruct
 model=Qwen2.5-VL-3B-Instruct
-model=Qwen2.5-VL-7B-Instruct
-experiment_name="mint-mathvista-$model-$prompt-$adv_estimator-$USER-000"
+# model=Qwen2.5-VL-7B-Instruct
+
+use_dpo_loss=True
+# use_dpo_loss=False
+
+
+experiment_name="mint-mathvista-$model-$prompt-$adv_estimator-dpo-$use_dpo_loss-$USER-0"
 # experiment_name=test
 export LOG_PATH=outputs/$experiment_name.log
 CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
@@ -136,30 +139,31 @@ CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
     data.train_batch_size=128 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.actor.strategy="fsdp2" \
-    actor_rollout_ref.actor.use_dpo_loss=True \
-    actor_rollout_ref.actor.dpo_coef=0.1 \
+    actor_rollout_ref.actor.use_dpo_loss=$use_dpo_loss \
+    actor_rollout_ref.actor.dpo_coef=.1 \
     actor_rollout_ref.actor.dpo_beta=0.1 \
     actor_rollout_ref.actor.dpo_loss_type=simpo \
     actor_rollout_ref.actor.simpo_gamma=0.5 \
     actor_rollout_ref.actor.dpo_label_smoothing=0.0 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    data.image_key=image \
+    data.image_key=images \
     data.prompt_key="problem" \
     data.response_key=answer \
     "data.system_prompt='${system_prompt}'" \
+    data.return_multi_modal_inputs=True \
     reward_model.enable=False \
     custom_reward_function.path=$custom_reward_function \
     actor_rollout_ref.model.path=Qwen/$model \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.use_fused_kernels=True \
+    actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -181,7 +185,7 @@ CUDA_VISIBLE_DEVICES=0 python -m verl.trainer.main_rgpo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='rgpo-0' \
+    trainer.project_name='rgpo-vlm-0' \
     trainer.experiment_name=$experiment_name \
     trainer.validation_data_dir=outputs/$experiment_name \
     trainer.rollout_data_dir=outputs/$experiment_name \

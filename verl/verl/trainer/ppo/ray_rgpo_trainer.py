@@ -1160,12 +1160,12 @@ class RayRGPOTrainer:
                                     chosen_labels[:, :prompt_len] = -100
                                     rejected_labels = rejected_input_ids.clone()
                                     rejected_labels[:, :prompt_len] = -100
-                                    print("chosen_input_ids", chosen_input_ids.shape)
-                                    print("chosen_attention_mask", chosen_attention_mask.shape)
-                                    print("chosen_labels", chosen_labels.shape)
-                                    print("rejected_input_ids", rejected_input_ids.shape)
-                                    print("rejected_attention_mask", rejected_attention_mask.shape)
-                                    print("rejected_labels", rejected_labels.shape)
+                                    # print("chosen_input_ids", chosen_input_ids.shape)
+                                    # print("chosen_attention_mask", chosen_attention_mask.shape)
+                                    # print("chosen_labels", chosen_labels.shape)
+                                    # print("rejected_input_ids", rejected_input_ids.shape)
+                                    # print("rejected_attention_mask", rejected_attention_mask.shape)
+                                    # print("rejected_labels", rejected_labels.shape)
                                     # Package Tensors
                                     # Update the batch with the DPO fields.  These keys will
                                     # be consumed by ``update_policy`` on the actor.
@@ -1182,8 +1182,12 @@ class RayRGPOTrainer:
                                         batch.batch["chosen_position_ids"] = chosen_position_ids
                                     if rejected_position_ids is not None:
                                         batch.batch["rejected_position_ids"] = rejected_position_ids
-
-
+                                    # # FIXME:
+                                    # batch.batch["chosen_input_ids"] = rejected_input_ids
+                                    # batch.batch["chosen_attention_mask"] = rejected_attention_mask
+                                    # batch.batch["chosen_labels"] = rejected_labels
+                                    # if rejected_position_ids is not None:
+                                    #     batch.batch["chosen_position_ids"] = rejected_position_ids
                                 except Exception as e_prep:
                                     print(f"ERROR preparing DPO batch at step {self.global_steps}: {e_prep}")
 

@@ -47,13 +47,69 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # ---- Add near the top (helpers) ----
 import torch.nn.functional as F
 
+def get_batch_logps(
+    token_logps: torch.Tensor,           # (B, T_resp) per-token log p(y_t | prefix, y_<t)
+    labels: torch.LongTensor,            # (B, T_resp) with -100 for padding
+    average_log_prob: bool = False,
+) -> torch.Tensor:                       # -> (B,)
+    mask = (labels != -100).to(token_logps.dtype)  # (B, T_resp)
+    seq_sum = (token_logps * mask).sum(dim=-1)     # (B,)
+    if average_log_prob:
+        lengths = mask.sum(dim=-1).clamp(min=1)    # (B,)
+        return seq_sum / lengths
+    return seq_sum
 
+
+def get_batch_logps_from_logits(
+    logits: torch.FloatTensor, labels: torch.LongTensor, average_log_prob: bool = False
+) -> torch.FloatTensor:
+    """
+    Compute the log probabilities of the given labels under the given logits.
+
+    Args:
+        logits: Logits of the model (e.g., huggingface CausalLMOutputs `logits`).
+                Shape: (batch_size, sequence_length, vocab_size)
+        labels: Labels for computing the sequence log probabilities. Shape: (batch_size, sequence_length)
+        average_log_prob: If True, return the average log probability per sequence. Otherwise, return the sum.
+
+    Returns:
+        A tensor of shape (batch_size,) containing the average/sum log probabilities of the given sequences.
+    """
+    if logits.shape[:-1] != labels.shape:
+        raise ValueError("Logits and labels must have the same shape[:-1]")
+
+    # Ensure labels are contiguous and on the same device as logits
+    labels = labels.contiguous().to(logits.device)
+    # Shift so that tokens < n predict n
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    # Calculate per token log probability
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    per_token_logps = -loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+    per_token_logps = per_token_logps.view(
+        shift_logits.size(0), shift_logits.size(1)
+    )  # Reshape back to (batch_size, seq_len-1)
+
+    # Create a mask for the labels that are not -100
+    loss_mask = shift_labels != -100
+
+    # Apply the mask to the per token log probabilities
+    masked_logps = per_token_logps * loss_mask
+
+    # Calculate the sum or average log probability per sequence
+    sequence_logps = masked_logps.sum(dim=-1)
+
+    if average_log_prob:
+        # Avoid division by zero for sequences with no valid tokens
+        num_valid_tokens = loss_mask.sum(dim=-1)
+        return sequence_logps / torch.clamp(num_valid_tokens, min=1)
+    else:
+        return sequence_logps
 
 
 def _dpo_loss(chosen_logps: torch.Tensor,
               rejected_logps: torch.Tensor,
-              chosen_labels: torch.LongTensor,
-              rejected_labels: torch.LongTensor,
               beta: float,
               loss_type: str = "sigmoid",
               label_smoothing: float = 0.0,
@@ -61,51 +117,7 @@ def _dpo_loss(chosen_logps: torch.Tensor,
               ) -> torch.Tensor:
     """Standard DPO: mean over pairs."""
 
-    def _dpo_get_batch_logps(scores: torch.Tensor,
-                            labels: torch.LongTensor,
-                            average_log_prob: bool = False) -> torch.FloatTensor:
-        """
-        Compute sequence log-probs on response tokens (labels=-100 are ignored).
-
-        Accepts:
-        - scores: [B, S, V] (logits or log-probs per vocab)  -> we log_softmax and gather
-        - scores: [B, S]   (already label-selected log-probs per step)
-        Returns:
-        - seq_logps: [B]
-        """
-        if scores.dim() not in (2, 3):
-            raise ValueError(f"scores must be rank-2 or rank-3, got {scores.dim()}")
-
-        labels = labels.contiguous().to(scores.device)
-        # print("labels", labels.shape)
-        if scores.dim() == 3:
-            raise ValueError
-            # Per-vocab scores: align next-token prediction
-            # Shift along sequence: predict token t from position t-1
-            shift_scores = scores[..., :-1, :].contiguous()             # [B, S-1, V]
-            shift_labels = labels[..., 1:].contiguous()                  # [B, S-1]
-            # Convert to log-probs and gather gold tokens
-            logp_per_tok = shift_scores.log_softmax(dim=-1).gather(
-                dim=-1, index=shift_labels.unsqueeze(-1)
-            ).squeeze(-1)                                               # [B, S-1]
-            mask = (shift_labels != -100)
-        else:
-            # Already label-selected log-probs per position
-            shift_logps = scores[..., 1:].contiguous()                   # [B, S-1]
-            shift_labels = labels[..., 1:].contiguous()                  # [B, S-1]
-            mask = (shift_labels != -100)
-            logp_per_tok = shift_logps * mask                            # [B, S-1]
-
-        seq_logps = (logp_per_tok * mask).sum(dim=-1)                    # [B]
-        if average_log_prob:
-            denom = torch.clamp(mask.sum(dim=-1), min=1)
-            seq_logps = seq_logps / denom
-        return seq_logps
-
-    policy_chosen_logps = _dpo_get_batch_logps(chosen_logps, chosen_labels, average_log_prob=loss_type in ["ipo", "simpo"],)
-    policy_rejected_logps = _dpo_get_batch_logps(rejected_logps, rejected_labels, average_log_prob=loss_type in ["ipo", "simpo"],)
-    
-    logits = policy_chosen_logps - policy_rejected_logps
+    logits = chosen_logps - rejected_logps
     if loss_type == "sigmoid":
         # label smoothing on pairwise preference
         loss = (-F.logsigmoid(beta * logits) * (1 - label_smoothing)
@@ -124,8 +136,8 @@ def _dpo_loss(chosen_logps: torch.Tensor,
         loss =  torch.relu(1 - beta * logits).mean()
     else:
         raise ValueError(f"Unknown dpo loss_type: {loss_type}")
-    chosen_rewards = beta * (policy_chosen_logps).detach()
-    rejected_rewards = beta * (policy_rejected_logps).detach()
+    chosen_rewards = beta * (chosen_logps).detach()
+    rejected_rewards = beta * (rejected_logps).detach()
 
     return loss, chosen_rewards, rejected_rewards
 
@@ -185,6 +197,7 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch["responses"].size(-1)
+        # print("response_length", response_length, response_length)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -259,7 +272,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
-
+                # print("multi_modal_inputs 1", multi_modal_inputs)
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -337,6 +350,7 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                # print("multi_modal_inputs 1", multi_modal_inputs)
 
                 output = self.actor_module(
                     input_ids=input_ids,
@@ -600,7 +614,12 @@ class DataParallelPPOActor(BasePPOActor):
                         rj_mask = model_inputs["rejected_attention_mask"]
                         rj_pos  = model_inputs["rejected_position_ids"]
                         rj_lbls = model_inputs["rejected_labels"]
-
+                        # print("ch_ids", ch_ids.shape, ch_ids)
+                        # print("ch_mask", ch_mask.shape, ch_mask)
+                        # print("ch_lbls", ch_lbls.shape, ch_lbls)
+                        # print("rj_ids", rj_ids.shape, rj_ids)
+                        # print("rj_mask", rj_mask.shape, rj_mask)
+                        # print("rj_lbls", rj_lbls.shape, rj_lbls)
                         # Handle Qwen2VL-style MRoPE position_ids if present
                         if ch_pos is not None:
                             if ch_pos.dim() == 3:
@@ -623,6 +642,7 @@ class DataParallelPPOActor(BasePPOActor):
                         if "multi_modal_inputs" in model_inputs:
                             from verl.utils.model import extract_multi_modal_inputs
                             mm_inputs = extract_multi_modal_inputs(model_inputs["multi_modal_inputs"])
+                        # print("mm_inputs", mm_inputs)
                         extra_args = {}
                         if self.use_fused_kernels:
                             extra_args["temperature"] = temperature
@@ -630,41 +650,66 @@ class DataParallelPPOActor(BasePPOActor):
                         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
                             ch_out = self.actor_module(
                                 input_ids=ch_ids, attention_mask=ch_mask, position_ids=ch_pos,
-                                **mm_inputs, use_cache=False, **extra_args,
+                                **mm_inputs, use_cache=False, **extra_args, #return_dict=True,
                             )
                             rj_out = self.actor_module(
                                 input_ids=rj_ids, attention_mask=rj_mask, position_ids=rj_pos,
-                                **mm_inputs, use_cache=False, **extra_args,
+                                **mm_inputs, use_cache=False, **extra_args, #return_dict=True,
                             )
                             # print("ch_out", ch_out)
                             # print("rj_out", rj_out)
+                        # print("ch_out.log_probs", ch_out.log_probs)
+                        # print("rj_out.log_probs", rj_out.log_probs)
+                        # print("ch_out.logits", ch_out.logits)
+                        # print("rj_out.logits", rj_out.logits)                        
+                        # if self.use_fused_kernels:
+                        #     ch_log_probs = ch_out.log_probs
+                        #     rj_log_probs = rj_out.log_probs
+                        #     # print("ch_log_probs", ch_log_probs.shape, ch_log_probs)
+                        #     # print("rj_log_probs", rj_log_probs.shape, rj_log_probs)
+                            
+                        #     # ch_logits = ch_logits[:, -response_length - 1 : -1]
+                        #     # rj_logits = rj_logits[:, -response_length - 1 : -1]
+
+                        #     # print("ch_logits", ch_logits.shape)
+                        #     # print("rj_logits", rj_logits.shape)
+                        # else:
+                        #     raise NotImplementedError
+
+                        average_log_prob=self.dpo_loss_type in ["ipo", "simpo"]
                         if self.use_fused_kernels:
                             ch_log_probs = ch_out.log_probs
                             rj_log_probs = rj_out.log_probs
-                            print("ch_log_probs", ch_log_probs.shape, ch_log_probs)
-                            print("rj_log_probs", rj_log_probs.shape, rj_log_probs)
+                            ch_log_probs = get_batch_logps(ch_log_probs, ch_lbls, average_log_prob=average_log_prob)
+                            rj_log_probs = get_batch_logps(rj_log_probs, rj_lbls, average_log_prob=average_log_prob)
                             
-                            # ch_logits = ch_logits[:, -response_length - 1 : -1]
-                            # rj_logits = rj_logits[:, -response_length - 1 : -1]
-
-                            # print("ch_logits", ch_logits.shape)
-                            # print("rj_logits", rj_logits.shape)
+                            # print("ch_logits", ch_logits.shape, ch_logits)
+                            # print("rj_logits", rj_logits.shape, rj_logits)
                         else:
-                            raise NotImplementedError
+                            ch_logits = ch_out.logits
+                            ch_logits.div_(temperature)
+                            ch_log_probs = get_batch_logps_from_logits(ch_logits, ch_lbls, average_log_prob=average_log_prob)
+                            # print("ch_logits", ch_logits.shape, ch_logits)
+                            # print("ch_log_probs", ch_log_probs.shape, ch_log_probs)
 
-
+                            rj_logits = rj_out.logits
+                            rj_logits.div_(temperature)
+                            rj_log_probs =  get_batch_logps_from_logits(rj_logits, rj_lbls, average_log_prob=average_log_prob)
+                            # print("rj_logits", rj_logits.shape, rj_logits)
+                            # print("rj_log_probs", rj_log_probs.shape, rj_log_probs)
                         dpo_loss, chosen_rewards, rejected_rewards = _dpo_loss(
                             chosen_logps=ch_log_probs,
                             rejected_logps=rj_log_probs,
-                            chosen_labels=ch_lbls,
-                            rejected_labels=rj_lbls,
                             beta=self.dpo_beta,
                             loss_type=self.dpo_loss_type,
                             label_smoothing=self.dpo_label_smoothing,
                             simpo_gamma=self.simpo_gamma
                         )
-                        loss = loss + self.dpo_coef * dpo_loss                    
-                        
+                        if torch.isfinite(dpo_loss).item():
+                            loss = loss + self.dpo_coef * dpo_loss  
+                            print("dpo_loss", dpo_loss )
+                        else:                  
+                            print("dpo_loss!!!", dpo_loss )
                     
                     
                     
