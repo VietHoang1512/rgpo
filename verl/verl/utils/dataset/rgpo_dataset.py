@@ -105,8 +105,13 @@ class RGPODataset(Dataset):
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
-        self.system_prompt = config.get("system_prompt", "You are a helpful assistant")
-        self.system_prompt = Path(self.system_prompt.strip()).read_text(encoding="utf-8")
+        system_prompt_cfg = config.get("system_prompt", "You are a helpful assistant")
+        system_prompt_path = Path(str(system_prompt_cfg).strip())
+        # Support both inline system prompt strings and file-based prompts.
+        if system_prompt_path.exists() and system_prompt_path.is_file():
+            self.system_prompt = system_prompt_path.read_text(encoding="utf-8")
+        else:
+            self.system_prompt = str(system_prompt_cfg)
         
         print("system_prompt", {self.system_prompt})
         
@@ -120,7 +125,7 @@ class RGPODataset(Dataset):
         self.response_key = config.get("response_key", "response")
         # cap response length in tokens (None = no cap)
         self.max_response_length = config.get("max_response_length", None)
-
+        self.max_hint_length = config.get("max_hint_length", None)
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count())
         self.use_shm = config.get("use_shm", False)
@@ -163,7 +168,7 @@ class RGPODataset(Dataset):
         image_key = self.image_key
         video_key = self.video_key
 
-        total_max = int(self.max_prompt_length) + int(self.max_response_length)
+        total_max = int(self.max_prompt_length) + int(self.max_hint_length)
 
         if processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
@@ -217,7 +222,7 @@ class RGPODataset(Dataset):
             if p_len > self.max_prompt_length:
                 return False
             # If a response exists, also enforce total cap
-            if f_len is not None and f_len > total_max:
+            if f_len is not None and f_len > total_max: # add some buffer for feedback generation
                 return False
             return True
 
@@ -226,8 +231,10 @@ class RGPODataset(Dataset):
             num_proc=self.num_workers,
             desc=f"Filtering prompts>{self.max_prompt_length} and full>{total_max} tokens",
         )
+        logger.warning("filter dataset len: %d/%d", len(new_dataframe), len(dataframe))
         print(f"filter dataset len: {len(new_dataframe)}/{len(dataframe)}")
         return new_dataframe
+
 
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_files")
@@ -244,25 +251,40 @@ class RGPODataset(Dataset):
     def _build_messages(self, example: dict):
         prompt = example.pop(self.prompt_key)
         if isinstance(prompt, list):
-            prompt = prompt[0]["content"]
-            print("prompt", prompt)
-        messages = [{"role": 'system', "content": self.system_prompt},{"role": "user", "content": prompt}]
-        if self.image_key in example or self.video_key in example:
-            for message in messages:
-                content = message["content"]
-                if self.processor is not None:
-                    content_list = []
-                    segments = re.split("(<image>|<video>)", content)
-                    segments = [item for item in segments if item != ""]
-                    for segment in segments:
-                        if segment == "<image>":
-                            content_list.append({"type": "image"})
-                        elif segment == "<video>":
-                            content_list.append({"type": "video"})
-                        else:
-                            content_list.append({"type": "text", "text": segment})
+            text_chunks = []
+            for item in prompt:
+                if isinstance(item, dict):
+                    content = item.get("content", "")
+                    if isinstance(content, str):
+                        text_chunks.append(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                text_chunks.append(part.get("text", ""))
+                elif isinstance(item, str):
+                    text_chunks.append(item)
+            prompt = "\n".join([chunk for chunk in text_chunks if chunk != ""])
+        elif prompt is None:
+            prompt = ""
+        else:
+            prompt = str(prompt)
 
-                    message["content"] = content_list
+        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": prompt}]
+        if self.image_key in example or self.video_key in example:
+            content = messages[-1]["content"]
+            if self.processor is not None and isinstance(content, str):
+                content_list = []
+                segments = re.split("(<image>|<video>)", content)
+                segments = [item for item in segments if item != ""]
+                for segment in segments:
+                    if segment == "<image>":
+                        content_list.append({"type": "image"})
+                    elif segment == "<video>":
+                        content_list.append({"type": "video"})
+                    else:
+                        content_list.append({"type": "text", "text": segment})
+
+                messages[-1]["content"] = content_list
 
         return messages
 
@@ -271,43 +293,63 @@ class RGPODataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
-        resp_text = row_dict[self.response_key]
-        messages = self._build_messages(row_dict)
-        if self.processor is not None:
-            full_messages = messages + [{"role": "assistant", "content": [{"type": "text", "text":resp_text}]}]
-        else:
-            full_messages = messages + [{"role": "assistant", "content": resp_text}]
-            
+        row_dict["sample_id"] = row_dict.get("sample_id", item)
+        return self.process(row_dict)
+
+    def process(self, row_dict: dict, max_length: int = None, messages: list[dict] = None, truncation: str = None):
+        # print("row_dict", row_dict)
+        # print("messages", messages)
+        resp_text = f"This is a dummy response: {__name__}"
+        processed = True
+        if messages is None:
+            resp_text = row_dict[self.response_key]
+            messages = self._build_messages(row_dict)
+            processed = False
         model_inputs = {}
         images, videos = None, None
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
             raw_prompt = self.processor.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs, 
             )
-            multi_modal_data = {}
+            if not processed:
+                multi_modal_data = {}
+                images = None
+                row_dict_images = row_dict.pop(self.image_key, None)
+                if row_dict_images:
+                    images = [process_image(image) for image in row_dict_images]
 
-            images = None
-            row_dict_images = row_dict.pop(self.image_key, None)
-            if row_dict_images:
-                images = [process_image(image) for image in row_dict_images]
+                    # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
+                    # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
+                    multi_modal_data["image"] = images
 
-                # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
-                # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
-                multi_modal_data["image"] = images
+                videos = None
+                row_dict_videos = row_dict.pop(self.video_key, None)
+                if row_dict_videos:
+                    videos = [process_video(video) for video in row_dict_videos]
 
-            videos = None
-            row_dict_videos = row_dict.pop(self.video_key, None)
-            if row_dict_videos:
-                videos = [process_video(video) for video in row_dict_videos]
+                    # due to the video key is "video" instead of "videos" in vllm, we need to use "video" here
+                    # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
+                    multi_modal_data["video"] = [video.numpy() for video in videos]
+                row_dict["multi_modal_data"] = multi_modal_data
+                row_dict["cached_multi_modal_data"] = multi_modal_data
 
-                # due to the video key is "video" instead of "videos" in vllm, we need to use "video" here
-                # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
-                multi_modal_data["video"] = [video.numpy() for video in videos]
-
-            model_inputs = self.processor(text=[raw_prompt], images=images, videos=videos, return_tensors="pt")
-
+            else:
+                multi_modal_data = row_dict.get("multi_modal_data", {})
+                images = multi_modal_data.get("image")
+                videos = multi_modal_data.get("video")
+            if max_length is None:
+                model_inputs = self.processor(text=[raw_prompt], images=images, videos=videos, return_tensors="pt")
+            else:
+                try:
+                    model_inputs = self.processor(text=[raw_prompt], images=images, videos=videos, return_tensors="pt", max_length=max_length)
+                except Exception as e:
+                    print(f"Error processing multi-modal data with max_length={max_length}: {e}")
+                    print(f"Raw prompt: {raw_prompt}")
+                    print(f"Images: {images}")
+                    print(f"Videos: {videos}")
+                    raise e
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
 
@@ -315,7 +357,6 @@ class RGPODataset(Dataset):
                 model_inputs.pop("second_per_grid_ts")
 
             # There's a trap here, multi_modal_inputs has to be a dict, not BatchFeature
-            row_dict["multi_modal_data"] = multi_modal_data
 
             # We will do batch.union() in the trainer,
             # so we cannot have "multi_modal_inputs" in row_dict if rollout generates new multi_modal_inputs
@@ -325,29 +366,6 @@ class RGPODataset(Dataset):
                 # second_per_grid_ts isn't used for training, just for mrope
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
-            full_text = self.processor.apply_chat_template(
-                full_messages,
-                add_generation_prompt=False,
-                tokenize=False,
-                **self.apply_chat_template_kwargs,
-            )
-            full_model_inputs = self.processor(
-                text=[full_text], images=images, videos=videos, return_tensors="pt"
-            )
-            full_input_ids = full_model_inputs.pop("input_ids")
-            full_attention_mask = full_model_inputs.pop("attention_mask")
-
-            if "second_per_grid_ts" in full_model_inputs:
-                full_model_inputs.pop("second_per_grid_ts")
-
-            # There's a trap here, multi_modal_inputs has to be a dict, not BatchFeature
-            # We will do batch.union() in the trainer,
-            # so we cannot have "multi_modal_inputs" in row_dict if rollout generates new multi_modal_inputs
-            if self.return_multi_modal_inputs:
-                row_dict["full_multi_modal_inputs"] = dict(full_model_inputs)
-
-                # second_per_gri d_ts isn't used for training, just for mrope
-                row_dict["full_multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
             if self.apply_chat_template_kwargs.get("chat_template") is None:
@@ -362,38 +380,13 @@ class RGPODataset(Dataset):
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
 
-            full_text = self.tokenizer.apply_chat_template(
-                full_messages,
-                add_generation_prompt=False,
-                tokenize=False,
-                **self.apply_chat_template_kwargs,
-            )
-            full_model_inputs = self.tokenizer(
-                full_text, return_tensors="pt", add_special_tokens=False
-            )
-            full_input_ids = full_model_inputs.pop("input_ids")
-            full_attention_mask = full_model_inputs.pop("attention_mask")
-            
-
-
-        row_dict["full_messages"] = full_messages
-
-        
-        full_input_ids, full_attention_mask = verl_F.postprocess_data(
-            input_ids=full_input_ids,
-            attention_mask=full_attention_mask,
-            max_length=self.max_prompt_length+self.max_response_length,
-            pad_token_id=self.tokenizer.pad_token_id,
-            left_pad=True,
-            truncation=self.truncation,
-        )        
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_length=self.max_prompt_length,
+            max_length=max_length or self.max_prompt_length,
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
-            truncation=self.truncation,
+            truncation=truncation or self.truncation,
         )
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
@@ -417,19 +410,6 @@ class RGPODataset(Dataset):
             position_ids = [torch.cat((text_position_ids, vision_position_ids), dim=0)]  # (1, 4, seq_length)
                 
             
-            # # # # # # # # # #
-            full_vision_position_ids = get_rope_index(
-                self.processor,
-                input_ids=full_input_ids[0],
-                image_grid_thw=full_model_inputs.get("image_grid_thw"),
-                video_grid_thw=full_model_inputs.get("video_grid_thw"),
-                second_per_grid_ts=full_model_inputs.get("second_per_grid_ts"),
-                attention_mask=full_attention_mask[0],
-            )  # (3, seq_length)
-            full_valid_mask = full_attention_mask[0].bool()
-            full_text_position_ids = torch.ones((1, len(full_input_ids[0])), dtype=torch.long)
-            full_text_position_ids[0, full_valid_mask] = torch.arange(full_valid_mask.sum().item())
-            full_position_ids = [torch.cat((full_text_position_ids, full_vision_position_ids), dim=0)]  # (1, 4, seq_length)
                          
         elif self.processor is not None and "Glm4vImageProcessor" in self.processor.image_processor.__class__.__name__:
             raise NotImplementedError
@@ -448,27 +428,25 @@ class RGPODataset(Dataset):
             position_ids = [torch.cat((text_position_ids, vision_position_ids), dim=0)]  # (1, 4, seq_length)
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
-            full_position_ids = compute_position_id_with_mask(full_attention_mask)
 
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
 
-        row_dict["full_input_ids"] = full_input_ids[0]
-        row_dict["full_attention_mask"] = full_attention_mask[0]
-        row_dict["full_position_ids"] = full_position_ids[0]
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.max_prompt_length:
-            if self.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
-            elif self.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
-            elif self.truncation == "middle":
-                left_half = self.max_prompt_length // 2
-                right_half = self.max_prompt_length - left_half
+        max_prompt_length = max_length if max_length is not None else self.max_prompt_length
+        effective_truncation = truncation or self.truncation
+        if len(raw_prompt_ids) > max_prompt_length:
+            if effective_truncation == "left":
+                raw_prompt_ids = raw_prompt_ids[-max_prompt_length :]
+            elif effective_truncation == "right":
+                raw_prompt_ids = raw_prompt_ids[: max_prompt_length]
+            elif effective_truncation == "middle":
+                left_half = max_prompt_length // 2
+                right_half = max_prompt_length - left_half
                 raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
-            elif self.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
+            elif effective_truncation == "error":
+                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {max_prompt_length}.")
 
         row_dict["raw_prompt_ids"] = raw_prompt_ids
          
@@ -476,7 +454,7 @@ class RGPODataset(Dataset):
         # encode prompts without chat template
         if self.return_raw_chat:
             row_dict["raw_prompt"] = messages
-            row_dict["full_raw_prompt"] = full_messages
+        row_dict["solution"] = resp_text
             
 
         # get prompts with chat template
@@ -495,8 +473,13 @@ class RGPODataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
-        return row_dict
 
+        # MM-HELIX specific: 
+        if "initial_state" in row_dict:
+            row_dict["extra_info"]["initial_state"] = row_dict["initial_state"]
+        if "score_function" in row_dict:
+            row_dict["extra_info"]["score_function"] = row_dict["score_function"]
+        return row_dict
     def __getstate__(self):
         if not self.serialize_dataset:
             state = self.__dict__.copy()

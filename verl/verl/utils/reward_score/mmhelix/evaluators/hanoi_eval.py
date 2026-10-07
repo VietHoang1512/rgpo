@@ -35,7 +35,7 @@ class TowerOfHanoiEvaluator(BaseEvaluator):
         return answer
 
     def evaluate(self, predicted_answer: str, ground_truth: Any, initial_state: Any) -> bool:
-        from vlmeval.dataset.utils.mmhelix.utils.validation import hanoi_check
+        from ..utils.validation import hanoi_check
         if not initial_state:
             return False
         lst = ast.literal_eval(initial_state) if isinstance(initial_state, str) else initial_state

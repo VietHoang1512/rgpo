@@ -222,7 +222,7 @@ dpo_loss_type: sigmoid
 dpo_label_smoothing: 0.0
 simpo_gamma: 0.5
 success_reward_threshold: 1.0
-reprompt_truncation: "right"
+reprompt_truncation: "middle"
 dont_reprompt_on_self_success: False
 remove_thinking_from_demonstration: False
 use_refine: False
@@ -234,3 +234,7 @@ feedback_template: "\nPrevious response:\n{response}\nFeedback for your previous
 include_environment_feedback: True
 max_reprompt_len: 10240
 refine_coef: 1.0
+# Refine acceptance gate. False (default) = per-sample (refined k vs unguided k);
+# True = paper-faithful group max (refined must beat max unguided reward over the prompt's rollouts).
+refine_gate_use_group_max: False
+refine_gate_margin: 0.0

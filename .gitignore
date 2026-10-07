@@ -8,16 +8,18 @@
 **/*.tar.gz
 **/playground
 **/wandb
-**/data/
+# Local dataset artifacts live at the repo root only. Do NOT use a bare `data/`
+# or `**/data/` pattern here: it also swallows `verl/verl/trainer/config/data/`,
+# which holds `legacy_data.yaml` -- a file the `defaults:` block of
+# `verl/verl/trainer/config/ppo_trainer.yaml` requires. Without it every Hydra
+# run dies at config composition.
+/data/
 MathRuler/
 data.json
 data.txt
-**/data/
-gsm8k.py
 image.zip
 prompts/ViRL39K/
 prompts/vlaa_data/
-data/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

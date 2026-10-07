@@ -77,7 +77,7 @@ echo "Using log prob micro batch size per GPU: $log_prob_batch_size_per_gpu"
 set -x
 # ray stop --force || true
 export LOG_PATH=outputs/$experiment_name.log
-python -m verl.trainer.main_fgpo \
+python -m verl.trainer.main_rgpo \
     algorithm.adv_estimator=$adv_estimator \
     data.train_files=data/mint_cot_r1_1024.parquet \
     data.val_files=data/mathvista_mini.parquet \

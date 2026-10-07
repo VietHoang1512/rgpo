@@ -85,10 +85,10 @@ def compute_score(predicted_answer, ground_truth, initial_state, score_function,
         return evaluator.evaluate(predicted_answer, ground_truth, initial_state, params)
     else:
         raise ValueError(f"Score function '{score_function}' not found in metrics.")
-    
+
 
 def format_reward(response: str) -> float:
-    pattern = re.compile(r"<think>.*</think>.*\\boxed\{.*\}.*", re.DOTALL)
+    pattern = re.compile(r".*\\boxed\{.*\}.*", re.DOTALL)
     # strip() so a leading/trailing newline or space (common under sampling) doesn't
     # zero the format bonus for otherwise well-formatted responses.
     format_match = re.fullmatch(pattern, response.strip())
@@ -127,10 +127,68 @@ def compute_score(solution_str: str, ground_truth: str,  data_source="unknown", 
             f.write(f"Score function: {score_function}\n")
             f.write(f"Feedback: {feedback}\n")
     # FIXME: debug
-    # feedback = ""        
+    # feedback = ""
     return {
         "score": score,
         "format_score": format_score,
         "accuracy_score": accuracy_score,
         "feedback": f"{feedback}\nFormat score: {format_score}/1.0\nAccuracy score: {accuracy_score}/1.0\nOverall score: {score}/1.0\nYou should maximize the overall score by improving both the format and accuracy of your answer.",
     }
+if __name__ == "__main__":
+    # Smoke tests for format_reward: returns 1.0 iff the (stripped) response
+    # contains a literal \boxed{...}. re.DOTALL lets .* span newlines, and the
+    # .strip() keeps leading/trailing whitespace from zeroing a valid response.
+    cases = [
+        (r"\boxed{42}", 1.0),
+        (r"The answer is \boxed{42}.", 1.0),
+        ("  \\boxed{42}  ", 1.0),                 # surrounding whitespace
+        ("\n\\boxed{5}\n", 1.0),                  # surrounding newlines
+        ("Step 1.\nStep 2.\n\\boxed{7}", 1.0),    # multiline reasoning
+        (r"\boxed{}", 1.0),                        # empty box still matches
+        (r"a \boxed{x} b \boxed{y} c", 1.0),      # multiple boxes
+        ("no box here", 0.0),
+        ("", 0.0),
+        (r"\boxed{42", 0.0),                       # missing closing brace
+        ("boxed{42}", 0.0),                        # missing leading backslash
+    ]
+    passed = 0
+    for i, (resp, expected) in enumerate(cases):
+        got = format_reward(resp)
+        ok = got == expected
+        passed += ok
+        print(f"[{'PASS' if ok else 'FAIL'}] case {i}: expected {expected}, got {got}  |  {resp!r}")
+    print(f"\n{passed}/{len(cases)} passed")
+    assert passed == len(cases), "format_reward tests failed"
+
+    # Smoke tests for parse(): extraction precedence is
+    # <|begin_of_box|> > <answer> > \boxed{} (with \text/ext/array/bmatrix
+    # sub-handling) > "Answer:" > original response; last match wins per tier.
+    parse_cases = [
+        ("x <|begin_of_box|>42<|end_of_box|> y", "42", "begin_of_box basic"),
+        ("<|begin_of_box|>A<|end_of_box|> <answer>B</answer> \\boxed{C}", "A", "box beats answer+boxed"),
+        ("<|begin_of_box|>first<|end_of_box|> <|begin_of_box|>second<|end_of_box|>", "second", "box last-match"),
+        ("reasoning <answer>the answer</answer>", "the answer", "answer basic"),
+        ("<answer>A</answer> \\boxed{B}", "A", "answer beats boxed"),
+        ("<answer>one</answer><answer>two</answer>", "two", "answer last-match"),
+        (r"The answer is \boxed{42}", "42", "boxed basic"),
+        (r"\boxed{f(x) = {a}}", "f(x) = {a}", "boxed single-level nesting"),
+        (r"\boxed{\text{hello}}", "hello", "boxed \\text{}"),
+        (r"\boxed{ext{world}}", "world", "boxed truncated ext{}"),
+        (r"\boxed{\begin{array}1 & 2\end{array}}", "1 & 2", "boxed array"),
+        (r"\boxed{\begin{bmatrix}1 & 2\end{bmatrix}}", "1 & 2", "boxed bmatrix"),
+        ("The answer. Answer: 42", "42", "Answer: basic"),
+        ("Answer：99", "99", "Answer fullwidth colon"),
+        (r"Answer: 10 and \boxed{20}", "20", "boxed beats Answer:"),
+        ("just some text with no answer marker", "just some text with no answer marker", "no marker -> original"),
+        ("", "", "empty -> ''"),
+        (None, "", "None -> ''"),
+    ]
+    p_passed = 0
+    for i, (resp, expected, label) in enumerate(parse_cases):
+        got = parse(resp)
+        ok = got == expected
+        p_passed += ok
+        print(resp)
+        print(f"[{'PASS' if ok else 'FAIL'}] parse {i:2d} ({label}): expected {expected!r}, got {got!r}")
+    print(f"\n{p_passed}/{len(parse_cases)} parse cases passed")
+    assert p_passed == len(parse_cases), "parse tests failed"

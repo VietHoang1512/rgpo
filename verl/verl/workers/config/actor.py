@@ -132,7 +132,11 @@ class ActorConfig(BaseConfig):
 
     # Feedback
     success_reward_threshold: float = 1.0
-    reprompt_truncation: str = "right"
+    # Truncation for the throwaway guided reprompt ({prompt}{hint}{prev_response}{feedback}{instruction}).
+    # "middle" keeps the question+hint at the front and the instruction+assistant header at the end,
+    # dropping the middle of the (long) previous response. Only affects guided-rollout generation,
+    # never the SFT target (which is conditioned on the original prompt).
+    reprompt_truncation: str = "middle"
     dont_reprompt_on_self_success: bool = False
     remove_thinking_from_demonstration: bool = False
     use_refine: Optional[bool] = False
@@ -157,6 +161,11 @@ class ActorConfig(BaseConfig):
     include_environment_feedback: bool = True
     max_reprompt_len: int = 10240
     refine_coef: float = 1.0
+    # Refine acceptance gate: how a refined (guided) sample's reward is compared to the unguided rollouts.
+    #   False (default) -> per-sample: accept if refined sample k beats unguided sample k.
+    #   True            -> paper-faithful: accept if refined beats the MAX reward over the prompt's group.
+    refine_gate_use_group_max: bool = False
+    refine_gate_margin: float = 0.0
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING

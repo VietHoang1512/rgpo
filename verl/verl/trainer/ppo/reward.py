@@ -38,8 +38,44 @@ def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
     merged_kwargs = {**kwargs, **extra_kwargs}
     # print("args", args)
     # print("merged_kwargs", merged_kwargs)
-    
+
     return raw_fn(*args, **merged_kwargs)
+
+
+def _register_module_pickle_by_value(module) -> None:
+    """Make cloudpickle serialize ``module`` by value instead of by reference.
+
+    The custom reward file is loaded under the synthetic name ``"custom_module"`` which only
+    lives in this (driver) process's ``sys.modules``. When the reward manager is shipped to a
+    Ray worker via ``compute_reward_async.remote(...)``, cloudpickle would otherwise serialize
+    the reward fn *by reference* to ``custom_module`` and the worker would die with
+    ``ModuleNotFoundError: No module named 'custom_module'``. Registering the module for
+    pickle-by-value embeds its code in the payload, so the worker needs no import.
+
+    Ray uses its own *vendored* cloudpickle for ``.remote()`` serialization, so we must
+    register there; we also register with the standalone cloudpickle for good measure.
+    """
+    candidates = []
+    try:
+        import ray.cloudpickle as ray_cloudpickle
+
+        candidates.append(ray_cloudpickle)
+    except Exception:
+        pass
+    try:
+        import cloudpickle
+
+        candidates.append(cloudpickle)
+    except Exception:
+        pass
+    for cp in candidates:
+        register = getattr(cp, "register_pickle_by_value", None)
+        if register is None:
+            continue
+        try:
+            register(module)
+        except Exception:
+            pass
 
 
 def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
@@ -84,6 +120,9 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
             spec.loader.exec_module(module)
         except Exception as e:
             raise RuntimeError(f"Error loading module from '{file_path}': {e}") from e
+
+    # Ensure the dynamically-loaded module ships by value to Ray workers (async reward path).
+    _register_module_pickle_by_value(module)
 
     if not hasattr(module, function_name):
         raise AttributeError(f"Reward function '{function_name}' not found in '{module.__file__}'.")

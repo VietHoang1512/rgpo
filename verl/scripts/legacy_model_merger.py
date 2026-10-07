@@ -53,7 +53,7 @@ from safetensors.torch import load_file
 from torch.distributed._tensor import Placement, Shard
 from transformers import (
     AutoConfig,
-        AutoTokenizer,
+    AutoTokenizer,
     AutoModelForCausalLM,
     AutoModelForTokenClassification,
     AutoModelForVision2Seq,

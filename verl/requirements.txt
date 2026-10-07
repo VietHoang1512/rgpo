@@ -24,3 +24,13 @@ fastapi
 latex2sympy2_extended
 math_verify
 tensorboard
+# --- additionally required by the reward functions used in this work ---
+# mathruler: imported by verl/utils/reward_score/{math_mint,math_rich,math_answer_rich,math_custom,math_ruler,geo3k}.py
+mathruler
+# regex: imported by verl/utils/reward_score/helix.py for recursive balanced-bracket matching
+regex
+# nltk: imported at module scope by verl/utils/reward_score/mmhelix/evaluators/wordladder_eval.py,
+# which mmhelix/metrics.py star-imports -- so `import verl.utils.reward_score.helix` fails outright
+# without it. The word-ladder evaluator also needs the corpus:
+#   python -c "import nltk; nltk.download('words')"
+nltk

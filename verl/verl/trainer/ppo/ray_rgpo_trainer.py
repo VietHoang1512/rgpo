@@ -17,7 +17,7 @@
 PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
-
+import re
 import json
 import os
 import uuid
@@ -25,8 +25,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
-
+from typing import Any, Optional
 import numpy as np
 import ray
 import torch
@@ -54,6 +53,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -311,7 +311,7 @@ class RayRGPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
-
+        print(f"reward_fn: {reward_fn}, val_reward_fn: {val_reward_fn}")
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -339,7 +339,19 @@ class RayRGPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-        self.use_dpo_loss = config.actor_rollout_ref.actor.use_dpo_loss 
+        self.curriculum_total_hint_rounds = max(int(self.config.trainer.total_epochs) - 1, 1)
+        self.current_epoch_idx = 0
+        self.prev_epoch_success_by_sample: dict[Any, bool] = {}
+        self.curr_epoch_best_score_by_sample: dict[Any, float] = {}
+        self.epoch_sample_scores: list[dict[Any, float]] = []
+        # FIMXE: 
+        print("XXX\n\n", self.config.actor_rollout_ref.actor.reprompt_template, "\n\n", self.config.actor_rollout_ref.actor.reprompt_template.format(
+            prompt="AAA",
+            solution="BBB",
+            feedback="CCC",
+        )
+)
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -365,7 +377,7 @@ class RayRGPOTrainer:
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
-
+        self.collate_fn = collate_fn
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
@@ -497,9 +509,346 @@ class RayRGPOTrainer:
 
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+####################################################################################
+    # New feedback generation
+    def _compute_or_extract_reward(
+        self,
+        batch: DataProto,
+        reward_fn=None,
+        return_dict: bool = False,
+        sum_reward: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor | dict[str, Any]:
+        """
+        Compute or extract reward from batch.
 
+        When use_reward_loop=True, rewards are already computed during generate_sequences
+        and stored in rm_scores. This method directly extracts them instead of calling
+        reward functions which would only perform format conversion.
+
+        Args:
+            batch: DataProto containing the batch data
+            reward_fn: Reward function to use if rm_scores doesn't exist (for training/validation)
+            return_dict: Whether to return dict format with reward_extra_info (for validation)
+            sum_reward: Whether to sum reward tensor along last dimension (for REMAX baseline)
+
+        Returns:
+            If return_dict=True: dict with "reward_tensor" and "reward_extra_info"
+            If return_dict=False and sum_reward=True: summed reward_tensor (1D tensor)
+            If return_dict=False and sum_reward=False: reward_tensor (2D tensor)
+        """
+        # When rm_scores already exists, extract it directly (format conversion only)
+        if "rm_scores" in batch.batch.keys():
+            reward_tensor = batch.batch["rm_scores"]
+            if sum_reward:
+                reward_tensor = reward_tensor.sum(dim=-1)
+
+            if return_dict:
+                # Extract reward_extra_info if available
+                reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+                reward_extra_info = (
+                    {key: batch.non_tensor_batch[key] for key in reward_extra_keys} if reward_extra_keys else {}
+                )
+                return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+            else:
+                # If sum_reward=True, only return tensor (for REMAX baseline)
+                if sum_reward:
+                    return reward_tensor
+                # Otherwise, return tuple with reward_extra_info (for training loop)
+                reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+                reward_extra_infos_dict = (
+                    {key: batch.non_tensor_batch[key] for key in reward_extra_keys} if reward_extra_keys else {}
+                )
+                return reward_tensor, reward_extra_infos_dict
+
+        # Otherwise, compute reward using reward_fn
+        if reward_fn is None:
+            raise ValueError("reward_fn must be provided when rm_scores is not available.")
+
+        if return_dict:
+            result = reward_fn(batch, return_dict=True)
+            reward_tensor = result["reward_tensor"]
+            if sum_reward:
+                reward_tensor = reward_tensor.sum(dim=-1)
+            reward_extra_info = result.get("reward_extra_info", {})
+            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+        else:
+            reward_tensor, reward_extra_infos_dict = compute_reward(batch, reward_fn)
+            if sum_reward:
+                reward_tensor = reward_tensor.sum(dim=-1)
+            return reward_tensor, reward_extra_infos_dict
+
+    @staticmethod
+    def _collect_feedback(
+        include_environment_feedback: bool,
+        reward_extra_infos_dict: Optional[dict[str, Any]],
+        batch_size: int
+    ) -> list[Any]:
+        """
+        Collect environment feedback from reward_extra_infos_dict.
+
+        Args:
+            include_environment_feedback: Whether to include environment feedback
+            reward_extra_infos_dict: Dictionary containing reward extra information
+            batch_size: Size of the batch
+
+        Returns:
+            List of feedback strings (or None for entries without feedback)
+        """
+        feedback_list: list[Any] = [None] * batch_size
+        # print("reward_extra_infos_dict", reward_extra_infos_dict)
+        if include_environment_feedback and reward_extra_infos_dict is not None:
+            raw_feedback = reward_extra_infos_dict.get("feedback", [])
+            for i in range(min(len(raw_feedback), batch_size)):
+                # Only include non-empty feedback strings
+                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
+                    feedback_list[i] = raw_feedback[i]
+        return feedback_list
+
+    def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        uids = batch.non_tensor_batch["uid"]
+        success_by_uid: dict[Any, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            if seq_scores[idx] >= success_reward_threshold:
+                success_by_uid[uid].append(idx)
+        return success_by_uid
+
+    @staticmethod
+    def _slice_solution_by_fraction(solution: Optional[str], fraction: float) -> Optional[str]:
+        if solution is None:
+            return None
+        if not isinstance(solution, str):
+            solution = str(solution)
+        solution = solution.strip()
+        if len(solution) == 0:
+            return None
+        clipped_fraction = max(0.0, min(1.0, float(fraction)))
+        if clipped_fraction <= 0.0:
+            return None
+        if clipped_fraction >= 1.0:
+            return solution
+
+        # tokens = solution.split()
+        # if len(tokens) <= 1:
+        keep_chars = max(1, int(np.ceil(len(solution) * clipped_fraction)))
+        return solution[:keep_chars]
+
+        # keep_tokens = max(1, int(np.ceil(len(tokens) * clipped_fraction)))
+        # return " ".join(tokens[:keep_tokens])
+
+    def _get_hint_fraction_for_epoch(self) -> float:
+        # Optional override: always reveal the full solution regardless of epoch index.
+        if self.config.actor_rollout_ref.actor.use_full_solution_hint:
+            return 1.0
+        # Epoch-0: no hint. Then reveal 1/N, 2/N, ..., N/N over the remaining N epochs.
+        if self.current_epoch_idx <= 0:
+            return 0.0
+        return min(1.0, float(self.current_epoch_idx) / float(self.curriculum_total_hint_rounds))
+
+    def _update_epoch_sample_scores(self, batch: DataProto, reward_tensor: torch.Tensor) -> None:
+        sample_ids = batch.non_tensor_batch.get("sample_id", None)
+        if sample_ids is None:
+            return
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+        for sample_id, score in zip(sample_ids, seq_scores, strict=True):
+            prev = self.curr_epoch_best_score_by_sample.get(sample_id, float("-inf"))
+            if score > prev:
+                self.curr_epoch_best_score_by_sample[sample_id] = float(score)
+
+    def _finalize_epoch_sample_scores(self, success_reward_threshold: float) -> None:
+        self.prev_epoch_success_by_sample = {
+            sample_id: score >= success_reward_threshold
+            for sample_id, score in self.curr_epoch_best_score_by_sample.items()
+        }
+        self.epoch_sample_scores.append(dict(self.curr_epoch_best_score_by_sample))
+
+    @staticmethod
+    def _remove_thinking_trace(text: str) -> str:
+        """Remove <think>...</think> tags and their content from text."""
+        return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+
+    def _get_solution(
+        self,
+        idx: int,
+        success_by_uid: dict[Any, list[int]],
+        uids: list[Any],
+        response_texts: list[str],
+        dont_reprompt_on_self_success: bool = False,
+        remove_thinking_from_demonstration: bool = False,
+    ) -> Optional[str]:
+        uid = uids[idx]
+        solution_idxs = success_by_uid[uid]
+        if dont_reprompt_on_self_success:
+            solution_idxs = [j for j in solution_idxs if j != idx]
+        if len(solution_idxs) == 0:
+            return None
+        solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
+        solution_str = response_texts[solution_idx]
+        if remove_thinking_from_demonstration:
+            solution_str = self._remove_thinking_trace(solution_str)
+        return solution_str
+
+
+    def _maybe_build_feedback_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: Optional[dict[str, list]] = None,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        include_environment_feedback = self.config.actor_rollout_ref.actor["include_environment_feedback"]
+        success_reward_threshold = self.config.actor_rollout_ref.actor["success_reward_threshold"]
+        responses = batch.batch["responses"]
+        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+        prompt_texts = []
+        user_contents = []
+
+        def _extract_prompt_and_content(content: Any) -> tuple[str, Any]:
+            """Extract prompt text from a user content payload and preserve its original structure."""
+            if isinstance(content, str):
+                return content, content
+
+            if isinstance(content, list):
+                prompt_parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        prompt_parts.append(part.get("text", ""))
+                if len(prompt_parts) == 0:
+                    raise ValueError(f"Prompt text not found in user message content: {content}")
+                return "\n".join([p for p in prompt_parts if p != ""]), content
+
+            raise ValueError(
+                f"Unsupported user message content type: {type(content)}. Content: {content}"
+            )
+
+        for msgs in batch.non_tensor_batch["raw_prompt"]:
+            assert len(msgs) == 2, (
+                f"Currently, we assume raw_prompt has at least system + user messages, but got {len(msgs)}. "
+                f"Raw prompt: {msgs}"
+            )
+            content = msgs[-1]["content"]
+            prompt, normalized_user_content = _extract_prompt_and_content(content)
+            prompt_texts.append(prompt)
+            user_contents.append(normalized_user_content)
+        batch_size = batch.batch.batch_size[0]
+        base_solution_strs = batch.non_tensor_batch["solution"]
+        sample_ids = batch.non_tensor_batch.get("sample_id", None)
+
+        hint_fraction = self._get_hint_fraction_for_epoch()
+        solution_strs: list[Optional[str]] = []
+        for i in range(batch_size):
+            sample_id = sample_ids[i] if sample_ids is not None else i
+            solved_last_epoch = self.prev_epoch_success_by_sample.get(sample_id, False)
+            if solved_last_epoch:
+                solution_strs.append(None)
+            else:
+                solution_strs.append(self._slice_solution_by_fraction(base_solution_strs[i], hint_fraction))
+
+        # Extract feedback if available and include_environment_feedback is enabled
+        feedback_list = self._collect_feedback(
+            include_environment_feedback=include_environment_feedback,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+            batch_size=batch_size,
+        )
+
+        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=success_reward_threshold)
+
+
+        def _build_feedback_message(i: int) -> list[dict]:
+            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+            has_solution = solution_strs[i] is not None
+            # print("system_messages:", system_messages)
+            # print(f"solution_strs[{i}]:", solution_strs[i])
+            # print(f"feedback_list[{i}]:", feedback_list[i])
+            # print(f"response_texts[{i}]:", response_texts[i])
+
+            # build solution section
+            solution_section = ""
+            if has_solution:
+                solution_section = self.config.actor_rollout_ref.actor.solution_template.format(
+                    solution=solution_strs[i]
+                )
+
+            # build feedback section
+            feedback_section = self.config.actor_rollout_ref.actor.feedback_template.format(
+                response=response_texts[i],
+                feedback=feedback_list[i]
+            )
+            # combine solution and feedback sections
+            reprompt_text = self.config.actor_rollout_ref.actor.reprompt_template.format(
+                prompt=prompt_texts[i],
+                solution=solution_section,
+                feedback=feedback_section,
+            )
+
+            base_user_content = user_contents[i]
+            if isinstance(base_user_content, list):
+                # Keep all non-text blocks (e.g., image/video) and replace textual instructions with reprompt text.
+                non_text_parts = [
+                    part
+                    for part in base_user_content
+                    if not (isinstance(part, dict) and part.get("type") == "text")
+                ]
+                new_user_content = non_text_parts + [{"type": "text", "text": reprompt_text}]
+            else:
+                new_user_content = reprompt_text
+
+            messages = system_messages + [{"role": "user", "content": new_user_content}]
+            # print(f"Built feedback message for sample {i}: {messages}")
+            return messages
+
+        messages = [_build_feedback_message(idx) for idx in range(batch_size)]
+        multi_modal_data = batch.non_tensor_batch.get("cached_multi_modal_data", None)
+        feedback_batch = []
+        for idx in range(batch_size):
+            row_dict = {}
+            if multi_modal_data is not None:
+                row_dict["multi_modal_data"] = multi_modal_data[idx]
+            feedback_batch.append(
+                self.train_dataset.process(
+                    row_dict=row_dict,
+                    messages=messages[idx],
+                    max_length=self.config.actor_rollout_ref.actor.max_reprompt_len,
+                    truncation=self.config.actor_rollout_ref.actor.get("reprompt_truncation", "middle"),
+                )
+            )
+        feedback_batch = self.collate_fn(feedback_batch)
+        # teacher_prompt = self.tokenizer.apply_chat_template(
+        #     messages,
+        #     tokenize=True,
+        #     return_tensors="pt",
+        #     return_dict=True,
+        #     continue_final_message=False,
+        #     add_generation_prompt=True,
+        #     max_length=self.config.actor_rollout_ref.actor.max_reprompt_len,
+        #     padding=True,
+        #     truncation=True,
+        # )
+        # teacher_input_ids = teacher_prompt["input_ids"].to(device)
+        # teacher_attention_mask = teacher_prompt["attention_mask"].to(device)
+        # teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+
+        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
+        # feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+        # feedback_used = [
+        #     feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+        #     for i in range(batch_size)
+        # ]
+
+
+        uids = set(batch.non_tensor_batch["uid"])
+        # num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+        # num_with_feedback_used = sum(1 for f in feedback_used if f)
+        # num_with_solution = sum(1 for s in solution_strs if s is not None)
+        metrics = {
+            "feedback/success_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
+            "feedback/hint_fraction": hint_fraction,
+            "feedback/hint_non_empty_fraction": float(sum(s is not None for s in solution_strs)) / float(batch_size),
+        }
+        return feedback_batch, metrics
+
+####################################################################################
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "sample_id"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -972,6 +1321,8 @@ class RayRGPOTrainer:
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
+            self.current_epoch_idx = epoch
+            self.curr_epoch_best_score_by_sample = {}
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1006,7 +1357,8 @@ class RayRGPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-
+                        print("batch", batch.batch.keys(), batch.non_tensor_batch.keys())
+                        print("gen batch output", gen_batch_output.batch.keys(), gen_batch_output.non_tensor_batch.keys())
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1023,7 +1375,7 @@ class RayRGPOTrainer:
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
                             batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
+                            print("REMAX")
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
@@ -1054,12 +1406,9 @@ class RayRGPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        
-                        # print("old_log_prob", old_log_prob)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1095,11 +1444,386 @@ class RayRGPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        self._update_epoch_sample_scores(batch, reward_tensor)
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        # Compute per-sample feedback mask by grouping with uid.
+                        # This is robust even if balance_batch has reordered rows.
+                        rewards_tensor = reward_tensor.sum(-1)
+                        batch.batch["raw_reward"] = rewards_tensor
+
+                        uids = np.asarray(batch.non_tensor_batch["uid"])
+                        success_reward_threshold = self.config.actor_rollout_ref.actor["success_reward_threshold"]
+                        uid2needs_feedback = {
+                            uid: rewards_tensor[uids == uid].max() < success_reward_threshold for uid in np.unique(uids)
+                        }
+                        num_prompts_total = len(uid2needs_feedback)
+                        num_prompts_all_wrong = int(sum(uid2needs_feedback.values()))
+                        prompts_all_wrong_ratio = (
+                            float(num_prompts_all_wrong) / float(num_prompts_total) if num_prompts_total > 0 else 0.0
+                        )
+                        metrics.update(
+                            {
+                                "rollout/all_wrong_prompt_ratio": prompts_all_wrong_ratio,
+                                "rollout/all_wrong_prompt_pct": 100.0 * prompts_all_wrong_ratio,
+                                "rollout/all_wrong_prompt_count": num_prompts_all_wrong,
+                                "rollout/prompt_count": num_prompts_total,
+                            }
+                        )
+                        need_feedback_mask = torch.tensor(
+                            [uid2needs_feedback[uid] for uid in uids],
+                            device=rewards_tensor.device,
+                            dtype=torch.float32,
+                        )
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                    #########################################                    
+                        if self.config.actor_rollout_ref.actor.use_refine:
+                        
+                            feedback_data, feedback_metrics = self._maybe_build_feedback_batch(batch, reward_tensor, reward_extra_infos_dict)
+                            feedback_batch : DataProto = DataProto.from_single_dict(feedback_data)
+
+                            feedback_batch.non_tensor_batch["uid"] = np.array(
+                                [str(uuid.uuid4()) for _ in range(len(feedback_batch.batch))], dtype=object
+                            )
+
+                            feedback_gen_batch = self._get_gen_batch(feedback_batch)
+
+                            # pass global_steps to trace
+                            feedback_gen_batch.meta_info["global_steps"] = self.global_steps
+
+                            with marked_timer("step", timing_raw):
+                                # generate a batch
+                                with marked_timer("gen", timing_raw, color="red"):
+                                    if not self.async_rollout_mode:
+                                        feedback_gen_batch_output = self.actor_rollout_wg.generate_sequences(feedback_gen_batch)
+                                    else:
+                                        feedback_gen_batch_output = self.async_rollout_manager.generate_sequences(feedback_gen_batch)
+
+                                    timing_raw.update(feedback_gen_batch_output.meta_info["timing"])
+                                    feedback_gen_batch_output.meta_info.pop("timing", None)
+                            print("feedback batch", feedback_batch.batch.keys(), feedback_batch.non_tensor_batch.keys())
+                            print("feedback gen batch output", feedback_gen_batch_output.batch.keys(), feedback_gen_batch_output.non_tensor_batch.keys())
+                            feedback_batch = feedback_batch.union(feedback_gen_batch_output)
+                            print(f"feedback_batch batch keys: {feedback_batch.batch.keys()}")
+                            print(f"feedback_batch non_tensor_batch keys: {feedback_batch.non_tensor_batch.keys()}")
+                            print(f"batch batch keys: {batch.batch.keys()}")
+                            print(f"batch non_tensor_batch keys: {batch.non_tensor_batch.keys()}")
+                            # feedback_batch.non_tensor_batch["ground_truth"] = batch.non_tensor_batch["ground_truth"]
+                            for key in batch.non_tensor_batch.keys():
+                                if key not in feedback_batch.non_tensor_batch:
+                                    print(f"Copying non-tensor batch key {key} from batch to feedback_batch")
+                                    feedback_batch.non_tensor_batch[key] = batch.non_tensor_batch[key]
+                                else:
+                                    print(f"feedback_batch already has non-tensor batch key {key}, skipping copy")
+                            if "response_mask" not in feedback_batch.batch.keys():
+                                feedback_batch.batch["response_mask"] = compute_response_mask(feedback_batch)
+                            feedback_batch.non_tensor_batch["extra_info"] = batch.non_tensor_batch.get("extra_info", {})  # ensure extra_info exists
+                            with marked_timer("reward", timing_raw, color="yellow"):
+                                # compute reward model score
+                                if self.use_rm and "rm_scores" not in feedback_batch.batch.keys():
+                                    feedback_reward_tensor = self.rm_wg.compute_rm_score(feedback_batch)
+                                    feedback_batch = feedback_batch.union(feedback_reward_tensor)
+
+                                if self.config.reward_model.launch_reward_fn_async:
+                                    feedback_future_reward = compute_reward_async.remote(data=feedback_batch, reward_fn=self.reward_fn)
+                                else:
+                                    feedback_reward_tensor, feedback_reward_extra_infos_dict = compute_reward(feedback_batch, self.reward_fn)
+                            if self.config.reward_model.launch_reward_fn_async:
+                                feedback_reward_tensor, feedback_reward_extra_infos_dict = ray.get(feedback_future_reward)
+                            
+                            # feedback if reward is improved after refinement
+                            feedback_reward = feedback_reward_tensor.sum(-1)
+                            print(f"feedback_reward: {feedback_reward.shape}, reward_tensor {rewards_tensor.shape}")
+                            refine_gate_margin = self.config.actor_rollout_ref.actor.get("refine_gate_margin", 0.0)
+                            if self.config.actor_rollout_ref.actor.get("refine_gate_use_group_max", False):
+                                # Paper-faithful gate: accept a refined sample only if it beats the MAX
+                                # unguided reward over the same prompt's rollouts (group max), plus margin:
+                                #   tilde_r_{i,k} > max_j r_{i,j} + delta
+                                uids_arr = np.asarray(batch.non_tensor_batch["uid"])
+                                group_max_reward = torch.empty_like(rewards_tensor)
+                                for uid in np.unique(uids_arr):
+                                    uid_mask = torch.as_tensor(uids_arr == uid, device=rewards_tensor.device)
+                                    group_max_reward[uid_mask] = rewards_tensor[uid_mask].max()
+                                feedback_improved_mask = (feedback_reward > group_max_reward + refine_gate_margin).float()
+                            else:
+                                # Default: per-sample gate (refined sample k vs unguided sample k).
+                                feedback_improved_mask = (feedback_reward > rewards_tensor + refine_gate_margin).float()
+                            # Optionally also require the prompt to be unsolved by unguided rollouts:
+                            #   feedback_mask = need_feedback_mask * feedback_improved_mask
+                            feedback_mask = feedback_improved_mask
+
+                            # Epoch-0 is pure PPO: keep refine weight at zero.
+                            if self.current_epoch_idx == 0:
+                                feedback_mask = torch.zeros_like(feedback_mask)
+
+                            # sanity check for feedback generation output
+                            # print(f"feedback_gen_batch_output batch keys: {feedback_gen_batch_output.batch.keys()}")
+                            # print(f"Feedback: {feedback_gen_batch_output.batch['responses'][:5]}") 
+                            refined_answers = feedback_gen_batch_output.batch["responses"]
+                            # print("Messages")
+                            refined_answers = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in refined_answers] 
+                            # print(f"Refined Answers: {refined_answers}")  # print first 5 generated feedback responses
+                            metrics.update(feedback_metrics)
+
+                            # ---- Diagnostics: is the guided rollout actually USING the hint? ----
+                            # The async guided reward is never written to LOG_PATH, so surface it here.
+                            # If the hint works, guided_solve_frac should rise toward 1.0 under a full
+                            # solution hint; if it stays ~= unguided_solve_frac the hint is being ignored.
+                            try:
+                                _gr = feedback_reward.detach().float().cpu()
+                                _ur = rewards_tensor.detach().float().cpu()
+                                _thr = float(success_reward_threshold)
+                                metrics["feedback/guided_solve_frac"] = (_gr >= _thr).float().mean().item()
+                                metrics["feedback/unguided_solve_frac"] = (_ur >= _thr).float().mean().item()
+                                metrics["feedback/guided_beats_unguided_frac"] = (_gr > _ur).float().mean().item()
+                                metrics["feedback/guided_reward_mean"] = _gr.mean().item()
+                                if os.environ.get("RGPO_DUMP_GUIDED"):
+                                    import json as _json
+                                    _prompts = feedback_batch.batch["prompts"]
+                                    _gt = batch.non_tensor_batch.get("ground_truth")
+                                    _sol = batch.non_tensor_batch.get("solution")
+                                    _dump_path = os.path.join(
+                                        os.environ.get("OUTPUT_DIR", "outputs"),
+                                        f"guided_dump_step{self.global_steps}.jsonl",
+                                    )
+                                    _k = min(8, len(refined_answers))
+                                    with open(_dump_path, "w") as _f:
+                                        for _i in range(_k):
+                                            _f.write(_json.dumps({
+                                                "reprompt": self.tokenizer.decode(_prompts[_i], skip_special_tokens=True),
+                                                "guided_response": refined_answers[_i],
+                                                "guided_reward": _gr[_i].item(),
+                                                "unguided_reward": _ur[_i].item(),
+                                                "ground_truth": (str(_gt[_i]) if _gt is not None else None),
+                                                "solution_hint_full": (str(_sol[_i]) if _sol is not None else None),
+                                                "hint_fraction": feedback_metrics.get("feedback/hint_fraction"),
+                                            }, ensure_ascii=False) + "\n")
+                                    print(f"[RGPO_DUMP_GUIDED] step {self.global_steps}: wrote {_k} examples to {_dump_path} "
+                                          f"| guided_solve={metrics['feedback/guided_solve_frac']:.3f} "
+                                          f"unguided_solve={metrics['feedback/unguided_solve_frac']:.3f}")
+                            except Exception as _e:
+                                print(f"[RGPO diag] skipped: {_e!r}")
+
+                            device = batch.batch["input_ids"].device
+                            # RGPO prompt-decoupled distillation: condition the refined response on the
+                            # ORIGINAL prompt x_i only, i.e. maximize p(tilde_y | x_i), NOT p(tilde_y | x_i, y_unguided).
+                            # NOTE: at this point batch["input_ids"] is the full [prompt ; first_unguided_response]
+                            # sequence (post gen union), so slice the prompt via batch["prompts"] instead.
+                            response_mask = feedback_batch.batch["response_mask"].to(device)
+                            responses = feedback_batch.batch["responses"].to(device)   # refined tilde_y
+                            prompt_ids = batch.batch["prompts"].to(device)             # [B, P] original prompt x_i
+                            prompt_len = prompt_ids.size(1)
+                            prompt_attention_mask = batch.batch["attention_mask"][:, :prompt_len].to(device)
+
+                            sft_input_ids = torch.cat([prompt_ids, responses], dim=1)
+                            sft_attention_mask = torch.cat([prompt_attention_mask, response_mask], dim=1)
+                            response_labels = responses.clone()
+                            response_labels = response_labels.masked_fill(response_mask == 0, -100)
+                            sft_labels = torch.cat(
+                                [torch.full_like(prompt_ids, -100), response_labels],
+                                dim=1,
+                            )
+                            # SFT position_ids: the refined response must continue the prompt's
+                            # position ids exactly as the rollout does
+                            # (verl vllm_rollout_spmd.py: resp_pos = prompt_pos[..., -1:] + arange(1, R+1)).
+                            # Offsetting by the prompt TOKEN COUNT is only correct for text; under
+                            # Qwen2-VL mRoPE an image spans many tokens but few position units, so a
+                            # token-count offset places the response ~100+ positions past the prompt and
+                            # corrupts the SFT forward. Anchor on the last real prompt position instead
+                            # (prompt is left-padded, so index -1 is the last real prompt token).
+                            prompt_position_ids = batch.batch["position_ids"].to(device)
+                            resp_len = response_mask.size(1)
+                            delta = torch.arange(1, resp_len + 1, device=device)
+                            if prompt_position_ids.dim() == 2:
+                                # Text-only: [B, S_full] -> prompt slice [B, P], then append refined response
+                                prompt_position_ids = prompt_position_ids[:, :prompt_len]
+                                response_position_ids = prompt_position_ids[:, -1:] + delta.unsqueeze(0)
+                                sft_position_ids = torch.cat(
+                                    [prompt_position_ids.long(), response_position_ids.long()], dim=1
+                                )
+                            elif prompt_position_ids.dim() == 3:
+                                # Multimodal/mRoPE: [B, C, S_full] -> prompt slice [B, C, P]
+                                prompt_position_ids = prompt_position_ids[:, :, :prompt_len]
+                                response_position_ids = prompt_position_ids[..., -1:] + delta.view(1, 1, -1)
+                                sft_position_ids = torch.cat(
+                                    [prompt_position_ids.long(), response_position_ids.long()],
+                                    dim=-1,
+                                )
+                            else:
+                                raise ValueError(
+                                    f"Unexpected prompt position_ids rank: {prompt_position_ids.dim()} "
+                                    f"shape={tuple(prompt_position_ids.shape)}"
+                                )
+                            batch.batch["sft_input_ids"] = sft_input_ids
+                            batch.batch["sft_attention_mask"] = sft_attention_mask
+                            batch.batch["sft_position_ids"] = sft_position_ids
+                            batch.batch["sft_labels"] = sft_labels
+                            batch.batch["feedback_reward"] = feedback_reward_tensor.sum(-1)
+                            # print(f"feedback_mask: {feedback_mask.shape}")
+                            # print("sft_input_ids", batch.batch["sft_input_ids"].shape)
+                            # print("feedback_reward", batch.batch["feedback_reward"].shape, batch.batch["feedback_reward"])
+                            batch.batch["feedback_mask"] = feedback_mask.to(device)
+                        #########################################
+                        if self.config.actor_rollout_ref.actor.use_sft:
+                            # Build direct SFT targets from ground-truth `solution`.
+                            # No rollout, no feedback, no reward recomputation.
+
+                            device = batch.batch["input_ids"].device
+                            batch_size = batch.batch.batch_size[0]
+
+                            if "solution" not in batch.non_tensor_batch:
+                                raise KeyError(
+                                    "use_sft=True requires `solution` in batch.non_tensor_batch."
+                                )
+
+                            raw_solutions = batch.non_tensor_batch["solution"]
+
+                            # FIXME:
+                            max_sft_response_len = 1024 
+
+                            pad_token_id = self.tokenizer.pad_token_id
+                            if pad_token_id is None:
+                                pad_token_id = self.tokenizer.eos_token_id
+                            if pad_token_id is None:
+                                raise ValueError("tokenizer must define pad_token_id or eos_token_id.")
+
+                            eos_token_id = self.tokenizer.eos_token_id
+
+                            solution_token_ids: list[list[int]] = []
+                            solution_non_empty: list[float] = []
+
+                            for sol in raw_solutions:
+                                if sol is None:
+                                    sol_text = ""
+                                elif isinstance(sol, str):
+                                    sol_text = sol.strip()
+                                else:
+                                    sol_text = str(sol).strip()
+
+                                ids = self.tokenizer.encode(
+                                    sol_text,
+                                    add_special_tokens=False,
+                                )
+
+                                # Match rollout-style response supervision: prompt is already present,
+                                # target is only assistant content. Append EOS so SFT learns to stop.
+                                if len(ids) > 0 and eos_token_id is not None and ids[-1] != eos_token_id:
+                                    ids.append(eos_token_id)
+
+                                ids = ids[:max_sft_response_len]
+                                solution_token_ids.append(ids)
+                                solution_non_empty.append(1.0 if len(ids) > 0 else 0.0)
+
+                            sft_responses = torch.full(
+                                (batch_size, max_sft_response_len),
+                                fill_value=pad_token_id,
+                                dtype=torch.long,
+                                device=device,
+                            )
+                            sft_response_mask = torch.zeros(
+                                (batch_size, max_sft_response_len),
+                                dtype=batch.batch["attention_mask"].dtype,
+                                device=device,
+                            )
+
+                            for i, ids in enumerate(solution_token_ids):
+                                if len(ids) == 0:
+                                    continue
+                                ids_tensor = torch.tensor(ids, dtype=torch.long, device=device)
+                                sft_responses[i, : len(ids)] = ids_tensor
+                                sft_response_mask[i, : len(ids)] = 1
+
+                            # Direct SFT also conditions on the ORIGINAL prompt only. batch["input_ids"]
+                            # here is the full [prompt ; unguided_response] sequence, so slice via prompts.
+                            prompt_ids = batch.batch["prompts"].to(device)             # [B, P] original prompt
+                            prompt_len = prompt_ids.size(1)
+                            prompt_attention_mask = batch.batch["attention_mask"][:, :prompt_len].to(device)
+
+                            sft_input_ids = torch.cat(
+                                [
+                                    prompt_ids,
+                                    sft_responses,
+                                ],
+                                dim=1,
+                            )
+                            sft_attention_mask = torch.cat(
+                                [
+                                    prompt_attention_mask,
+                                    sft_response_mask,
+                                ],
+                                dim=1,
+                            )
+
+                            response_labels = sft_responses.clone()
+                            response_labels = response_labels.masked_fill(
+                                sft_response_mask == 0,
+                                -100,
+                            )
+                            sft_labels = torch.cat(
+                                [
+                                    torch.full_like(prompt_ids, -100),
+                                    response_labels,
+                                ],
+                                dim=1,
+                            )
+
+                            # SFT position_ids: continue the prompt's position ids like the rollout
+                            # (resp_pos = prompt_pos[..., -1:] + arange(1, R+1)). See the guided-SFT
+                            # block above: a token-count offset is wrong under Qwen2-VL mRoPE, so anchor
+                            # on the last real prompt position (prompt is left-padded => index -1).
+                            prompt_position_ids = batch.batch["position_ids"].to(device)
+                            resp_len = sft_response_mask.size(1)
+                            delta = torch.arange(1, resp_len + 1, device=device)
+
+                            if prompt_position_ids.dim() == 2:
+                                # Text-only: slice prompt positions [B, P]
+                                prompt_position_ids = prompt_position_ids[:, :prompt_len]
+                                response_position_ids = prompt_position_ids[:, -1:] + delta.unsqueeze(0)
+                                sft_position_ids = torch.cat(
+                                    [
+                                        prompt_position_ids.long(),
+                                        response_position_ids.long(),
+                                    ],
+                                    dim=1,
+                                )
+                            elif prompt_position_ids.dim() == 3:
+                                # Qwen2-VL / mRoPE: slice prompt positions [B, C, P]
+                                prompt_position_ids = prompt_position_ids[:, :, :prompt_len]
+                                response_position_ids = prompt_position_ids[..., -1:] + delta.view(1, 1, -1)
+                                sft_position_ids = torch.cat(
+                                    [
+                                        prompt_position_ids.long(),
+                                        response_position_ids.long(),
+                                    ],
+                                    dim=-1,
+                                )
+                            else:
+                                raise ValueError(
+                                    f"Unexpected prompt position_ids rank: "
+                                    f"{prompt_position_ids.dim()} "
+                                    f"shape={tuple(prompt_position_ids.shape)}"
+                                )
+
+                            batch.batch["sft_input_ids"] = sft_input_ids
+                            batch.batch["sft_attention_mask"] = sft_attention_mask
+                            batch.batch["sft_position_ids"] = sft_position_ids
+                            batch.batch["sft_labels"] = sft_labels
+                            batch.batch["feedback_reward"] = torch.zeros_like(rewards_tensor).to(device)
+                            batch.batch["feedback_mask"] = torch.ones_like(rewards_tensor).to(device)  # all samples get feedback for direct SFT
+                            
+                            metrics.update(
+                                {
+                                    "sft/solution_avg_target_tokens": float(
+                                        sft_response_mask.sum(dim=-1).float().mean().detach().cpu().item()
+                                    ),
+                                    "sft/solution_max_target_tokens": float(
+                                        sft_response_mask.sum(dim=-1).max().detach().cpu().item()
+                                    ),
+                                }
+                            ) 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -1108,7 +1832,6 @@ class RayRGPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
@@ -1124,74 +1847,6 @@ class RayRGPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                        if self.use_dpo_loss:
-                            with marked_timer("prepare_dpo_batch", timing_raw):
-                                try:
-
-
-                                    # Check required base keys
-                                    required_keys = ["full_input_ids", "full_attention_mask", "input_ids", "attention_mask", "response_mask"]
-                                    for rk in required_keys:
-                                        if rk not in batch.batch or batch.batch[rk] is None:
-                                            raise KeyError(f"Required key '{rk}' missing from batch for DPO prep.")
-
-
-
-                                    # Gather Chosen/Rejected Base Tensors
-                                    chosen_input_ids = batch.batch["full_input_ids"]
-                                    chosen_attention_mask = batch.batch["full_attention_mask"]
-                                    rejected_input_ids = batch.batch["input_ids"]
-                                    rejected_attention_mask = batch.batch["attention_mask"]
-                                    chosen_position_ids = (
-                                        batch.batch.get("full_position_ids")
-                                        if "position_ids" in batch.batch
-                                        else None
-                                    )
-                                    rejected_position_ids = (
-                                        batch.batch.get("position_ids")
-                                        if "position_ids" in batch.batch
-                                        else None
-                                    )
-
-                                    # Create Labels
-                                    print("WARNING: Creating DPO labels using configured max_prompt_length...")
-                                    prompt_len = self.config.data.max_prompt_length
-                                    chosen_labels = chosen_input_ids.clone()
-                                    chosen_labels[:, :prompt_len] = -100
-                                    rejected_labels = rejected_input_ids.clone()
-                                    rejected_labels[:, :prompt_len] = -100
-                                    # print("chosen_input_ids", chosen_input_ids.shape)
-                                    # print("chosen_attention_mask", chosen_attention_mask.shape)
-                                    # print("chosen_labels", chosen_labels.shape)
-                                    # print("rejected_input_ids", rejected_input_ids.shape)
-                                    # print("rejected_attention_mask", rejected_attention_mask.shape)
-                                    # print("rejected_labels", rejected_labels.shape)
-                                    # Package Tensors
-                                    # Update the batch with the DPO fields.  These keys will
-                                    # be consumed by ``update_policy`` on the actor.
-                                    batch.batch["chosen_input_ids"] = chosen_input_ids
-                                    batch.batch["chosen_attention_mask"] = chosen_attention_mask
-                                    batch.batch["chosen_labels"] = chosen_labels
-
-                                                                        
-                                    batch.batch["rejected_input_ids"] = rejected_input_ids
-                                    batch.batch["rejected_attention_mask"] = rejected_attention_mask
-                                    batch.batch["rejected_labels"] = rejected_labels
-                                    # Conditionally add reference logps if computed
-                                    if chosen_position_ids is not None:
-                                        batch.batch["chosen_position_ids"] = chosen_position_ids
-                                    if rejected_position_ids is not None:
-                                        batch.batch["rejected_position_ids"] = rejected_position_ids
-                                    # # FIXME:
-                                    # batch.batch["chosen_input_ids"] = rejected_input_ids
-                                    # batch.batch["chosen_attention_mask"] = rejected_attention_mask
-                                    # batch.batch["chosen_labels"] = rejected_labels
-                                    # if rejected_position_ids is not None:
-                                    #     batch.batch["chosen_position_ids"] = rejected_position_ids
-                                except Exception as e_prep:
-                                    print(f"ERROR preparing DPO batch at step {self.global_steps}: {e_prep}")
-
-
 
                     # update critic
                     if self.use_critic:
@@ -1305,3 +1960,7 @@ class RayRGPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            self._finalize_epoch_sample_scores(
+                success_reward_threshold=self.config.actor_rollout_ref.actor["success_reward_threshold"]
+            )
