@@ -18,7 +18,9 @@
 
 ## Why RGPO?
 
-Group-based RLVR methods such as GRPO learn by comparing several attempts at the same problem. When every attempt fails, there is nothing to compare, so the hardest problems contribute **little or no learning signal**. Training on reference solutions has its own costs: it pushes the model to imitate text unlike its own, and the references usually have to match the RL answer format, which often means rejection sampling from a stronger model. Tutoring research calls this tension the *assistance dilemma*: too little help leaves a learner stuck, while too much reduces effort and transfer. RGPO uses the reference only to help the model *find* an answer, then learns from the answer the model wrote itself.
+On-policy reinforcement learning remains fundamentally constrained by the current capability of the policy model. When the model is trained on problems beyond its evolving reasoning ability, all sampled rollouts for a prompt may be incorrect: rewards become sparse or uniform, and the training process can stagnate precisely on the hard examples that are most important for improving reasoning. A natural direction for mitigating reward sparsity is to incorporate external guidance, such as reference solutions or expert traces. However, maximizing the likelihood of those reference solutions may force the model to imitate trajectories that are far from its own policy distribution, causing distribution mismatch, memorization, and limited generalization.
+
+Human learning research suggests that effective reasoning instruction requires a careful balance between independent problem solving and guided assistance. Learners benefit from attempting a problem before receiving explicit instruction; at the same time, too little help may leave them stuck, whereas too much help may reduce effort, encourage shallow processing, and weaken transfer. Motivated by this perspective, RGPO builds on the standard RLVR training loop and uses reference rationales as temporary scaffolds for exploration rather than as direct imitation targets.
 
 
 ### Language models
